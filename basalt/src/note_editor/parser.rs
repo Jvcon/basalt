@@ -122,11 +122,32 @@ impl<'a> Parser<'a> {
                 }
 
                 Event::Text(text) => {
-                    let mut text_segment = TextSegment::plain(&text);
-                    inline_styles.iter().for_each(|style| {
-                        text_segment.add_style(style);
-                    });
-                    text_segments.push(text_segment);
+                    // ITS Theme task marker detection: only on the very first text segment
+                    // of a Tag::Item that has not already received a TaskListMarker event (D-05, D-06).
+                    let detected = if matches!(tag, Tag::Item)
+                        && state.task_kind.is_empty()
+                        && text_segments.is_empty()
+                    {
+                        extract_its_marker(&text)
+                    } else {
+                        None
+                    };
+
+                    if let Some((kind, remaining)) = detected {
+                        state.task_kind.push(kind);
+                        // Only add a text segment for the content after the marker (D-08)
+                        if !remaining.is_empty() {
+                            let mut seg = TextSegment::plain(remaining);
+                            inline_styles.iter().for_each(|s| seg.add_style(s));
+                            text_segments.push(seg);
+                        }
+                    } else {
+                        let mut text_segment = TextSegment::plain(&text);
+                        inline_styles.iter().for_each(|style| {
+                            text_segment.add_style(style);
+                        });
+                        text_segments.push(text_segment);
+                    }
                 }
 
                 Event::SoftBreak => {
@@ -363,6 +384,74 @@ fn extract_paragraph_text(node: &ast::Node) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Attempts to extract an ITS Theme task marker from the start of a text segment.
+///
+/// Matches the pattern `[char]` at the beginning of `text` (after optional leading whitespace),
+/// where `char` is exactly one character from the 35 ITS Theme marker set.
+///
+/// Returns `Some((TaskKind, remaining))` where `remaining` is the text after the `[char]` marker
+/// and any immediately following whitespace. Returns `None` if the text does not start with a
+/// recognized `[char]` pattern.
+fn extract_its_marker(text: &str) -> Option<(ast::TaskKind, &str)> {
+    let trimmed = text.trim_start();
+
+    // Must start with '['
+    let rest = trimmed.strip_prefix('[')?;
+
+    // Isolate the single char between '[' and ']'
+    let mut chars = rest.chars();
+    let marker_char = chars.next()?;
+    let after_char = chars.as_str();
+
+    // Next char must be ']'
+    let after_bracket = after_char.strip_prefix(']')?;
+
+    // Map the marker char to a TaskKind variant (case-sensitive — [C] ≠ [c])
+    let kind = match marker_char {
+        '-' => ast::TaskKind::Dropped,
+        '>' => ast::TaskKind::Forward,
+        '<' => ast::TaskKind::Migrated,
+        'D' => ast::TaskKind::Date,
+        '?' => ast::TaskKind::Question,
+        '/' => ast::TaskKind::HalfDone,
+        '+' => ast::TaskKind::Add,
+        'R' => ast::TaskKind::Research,
+        '!' => ast::TaskKind::Important,
+        'i' => ast::TaskKind::Idea,
+        'B' => ast::TaskKind::Brainstorm,
+        'P' => ast::TaskKind::Pro,
+        'C' => ast::TaskKind::Con,
+        'Q' => ast::TaskKind::Quote,
+        'N' => ast::TaskKind::Note,
+        'b' => ast::TaskKind::Bookmark,
+        'I' => ast::TaskKind::Information,
+        'p' => ast::TaskKind::Paraphrase,
+        'L' => ast::TaskKind::Location,
+        'E' => ast::TaskKind::Example,
+        'A' => ast::TaskKind::Answer,
+        'r' => ast::TaskKind::Reward,
+        'c' => ast::TaskKind::Choice,
+        'd' => ast::TaskKind::Doing,
+        'T' => ast::TaskKind::Time,
+        '@' => ast::TaskKind::Character,
+        't' => ast::TaskKind::Talk,
+        'O' => ast::TaskKind::Outline,
+        '~' => ast::TaskKind::Conflict,
+        'W' => ast::TaskKind::World,
+        'f' => ast::TaskKind::Clue,
+        'F' => ast::TaskKind::Foreshadow,
+        'H' => ast::TaskKind::Favorite,
+        '&' => ast::TaskKind::Symbolism,
+        's' => ast::TaskKind::Secret,
+        // Unknown char: LooselyChecked fallback stores the original char (D-04)
+        c => ast::TaskKind::LooselyChecked(c),
+    };
+
+    // Strip one leading space after `]` if present (e.g., "[>] text" → "text")
+    let remaining = after_bracket.strip_prefix(' ').unwrap_or(after_bracket);
+    Some((kind, remaining))
 }
 
 pub fn from_str(text: &str) -> Vec<Node> {
@@ -645,5 +734,104 @@ mod tests {
 
         let (kind, _, _) = parse_bq("> [!caution]\n> body");
         assert_eq!(kind, Some(ast::BlockQuoteKind::Caution));
+    }
+
+    #[test]
+    fn test_extract_its_marker_known() {
+        assert_eq!(
+            extract_its_marker("[>] Schedule this"),
+            Some((ast::TaskKind::Forward, "Schedule this"))
+        );
+        assert_eq!(
+            extract_its_marker("[!] Critical"),
+            Some((ast::TaskKind::Important, "Critical"))
+        );
+        assert_eq!(
+            extract_its_marker("[C] Against"),
+            Some((ast::TaskKind::Con, "Against"))
+        );
+        assert_eq!(
+            extract_its_marker("[c] Pick one"),
+            Some((ast::TaskKind::Choice, "Pick one"))
+        );
+        assert_eq!(
+            extract_its_marker("[-] Dropped task"),
+            Some((ast::TaskKind::Dropped, "Dropped task"))
+        );
+        assert_eq!(
+            extract_its_marker("[?] A question"),
+            Some((ast::TaskKind::Question, "A question"))
+        );
+    }
+
+    #[test]
+    fn test_extract_its_marker_loosely_checked() {
+        // Unknown char → LooselyChecked(char)
+        assert_eq!(
+            extract_its_marker("[z] Unknown"),
+            Some((ast::TaskKind::LooselyChecked('z'), "Unknown"))
+        );
+        assert_eq!(
+            extract_its_marker("[y]"),
+            Some((ast::TaskKind::LooselyChecked('y'), ""))
+        );
+    }
+
+    #[test]
+    fn test_extract_its_marker_no_match() {
+        // Not a [char] pattern
+        assert_eq!(extract_its_marker("plain text"), None);
+        assert_eq!(extract_its_marker("[no closing bracket"), None);
+        // Multi-char inside brackets → None (not a single char pattern)
+        assert_eq!(extract_its_marker("[ab] text"), None);
+    }
+
+    #[test]
+    fn test_parse_its_theme_task_items() {
+        let md = indoc! {"
+            - [>] Forwarded item
+            - [!] Important item
+            - [c] Choice item
+        "};
+        let nodes = from_str(md);
+        // Should produce 1 List with 3 Task nodes
+        assert_eq!(nodes.len(), 1, "expected one top-level List node");
+        if let Node::List { nodes: items, .. } = &nodes[0] {
+            assert_eq!(items.len(), 3);
+            if let Node::Task { kind, .. } = &items[0] {
+                assert_eq!(*kind, ast::TaskKind::Forward, "first item should be Forward");
+            } else {
+                panic!("expected Task node for [>] item");
+            }
+            if let Node::Task { kind, .. } = &items[1] {
+                assert_eq!(*kind, ast::TaskKind::Important, "second item should be Important");
+            } else {
+                panic!("expected Task node for [!] item");
+            }
+            if let Node::Task { kind, .. } = &items[2] {
+                assert_eq!(*kind, ast::TaskKind::Choice, "third item should be Choice");
+            } else {
+                panic!("expected Task node for [c] item");
+            }
+        } else {
+            panic!("expected List node");
+        }
+    }
+
+    #[test]
+    fn test_standard_markers_unaffected() {
+        // Standard markers ([x], [ ]) should still use TaskListMarker path
+        let md = "- [x] Done\n- [ ] Todo\n";
+        let nodes = from_str(md);
+        assert_eq!(nodes.len(), 1);
+        if let Node::List { nodes: items, .. } = &nodes[0] {
+            assert_eq!(items.len(), 2);
+            if let Node::Task { kind, .. } = &items[0] {
+                assert_eq!(*kind, ast::TaskKind::Checked);
+            }
+            if let Node::Task { kind, .. } = &items[1] {
+                assert_eq!(*kind, ast::TaskKind::Unchecked);
+            }
+        }
     }
 }

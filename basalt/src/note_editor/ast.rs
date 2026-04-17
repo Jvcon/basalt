@@ -70,16 +70,91 @@ pub enum ItemKind {
     Unordered,
 }
 
-/// Represents the variant of a list or task item (checked, unchecked, etc.).
+/// Represents the variant of a list or task item (checked, unchecked, or an ITS Theme marker).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskKind {
-    /// A checkbox item that is marked as done using `- [x]`.
+    // Standard markers
+    /// A checkbox item that is marked as done using `- [x]` or `- [X]`.
     Checked,
     /// A checkbox item that is unchecked using `- [ ]`.
     Unchecked,
-    /// A checkbox item that is checked, but not explicitly recognized as
-    /// `Checked` (e.g., `- [?]`).
-    LooselyChecked,
+
+    // ITS Theme markers (35), in ITS Theme source order
+    /// `- [-]` dropped
+    Dropped,
+    /// `- [>]` forwarded / scheduled
+    Forward,
+    /// `- [<]` migrated
+    Migrated,
+    /// `- [D]` date
+    Date,
+    /// `- [?]` question
+    Question,
+    /// `- [/]` half done
+    HalfDone,
+    /// `- [+]` add
+    Add,
+    /// `- [R]` research
+    Research,
+    /// `- [!]` important
+    Important,
+    /// `- [i]` idea
+    Idea,
+    /// `- [B]` brainstorm
+    Brainstorm,
+    /// `- [P]` pro
+    Pro,
+    /// `- [C]` con
+    Con,
+    /// `- [Q]` quote
+    Quote,
+    /// `- [N]` note
+    Note,
+    /// `- [b]` bookmark
+    Bookmark,
+    /// `- [I]` information
+    Information,
+    /// `- [p]` paraphrase
+    Paraphrase,
+    /// `- [L]` location
+    Location,
+    /// `- [E]` example
+    Example,
+    /// `- [A]` answer
+    Answer,
+    /// `- [r]` reward
+    Reward,
+    /// `- [c]` choice
+    Choice,
+    /// `- [d]` doing
+    Doing,
+    /// `- [T]` time
+    Time,
+    /// `- [@]` character / person
+    Character,
+    /// `- [t]` talk
+    Talk,
+    /// `- [O]` outline / plot
+    Outline,
+    /// `- [~]` conflict
+    Conflict,
+    /// `- [W]` world
+    World,
+    /// `- [f]` clue / find
+    Clue,
+    /// `- [F]` foreshadow
+    Foreshadow,
+    /// `- [H]` favorite / health
+    Favorite,
+    /// `- [&]` symbolism
+    Symbolism,
+    /// `- [s]` secret
+    Secret,
+
+    // Fallback
+    /// Any `[char]` not matching the 35 ITS Theme markers above.
+    /// Stores the original character so the renderer can display `[char]` as-is.
+    LooselyChecked(char),
 }
 
 pub type SourceRange<Idx> = std::ops::Range<Idx>;

@@ -20,5 +20,5 @@ expression: terminal.backend()
 "│ ┃ You can use any character inside the brackets to mark it as complete.      ║"
 "│ ┃                                                                            ║"
 "│ ┃ ■ Milk                                                                     ║"
-"│ ┃ ● [?] Eggs                                                                 ║"
+"│ ┃ ❓ Eggs                                                                    ║" Hidden by multi-width symbols: [(5, " ")]
 "╰ READ ────────────────────────────────────────────────────────────────────────▼"

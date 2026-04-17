@@ -67,21 +67,93 @@ pub enum Style {
     Strong,
 }
 
-/// Represents the variant of a list or task item (checked, unchecked, etc.).
+/// Represents the variant of a list or task item (checked, unchecked, or an ITS Theme marker).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
-    /// A checkbox item that is marked as done using `- [x]`.
+    /// `- [x]` / `- [X]`: checked task item
     HardChecked,
-    /// A checkbox item that is checked, but not explicitly recognized as
-    /// `HardChecked` (e.g., `- [?]`).
-    Checked,
-    /// A checkbox item that is unchecked using `- [ ]`.
+    /// `- [ ]`: unchecked task item
     Unchecked,
     // TODO: Remove in favor of using List node that has children of nodes
     /// An ordered list item (e.g., `1. item`), storing the numeric index.
     Ordered(u64),
     /// An unordered list item (e.g., `- item`).
     Unordered,
+
+    // ITS Theme markers (35), in ITS Theme source order
+    /// `- [-]` dropped
+    Dropped,
+    /// `- [>]` forwarded / scheduled
+    Forward,
+    /// `- [<]` migrated
+    Migrated,
+    /// `- [D]` date
+    Date,
+    /// `- [?]` question
+    Question,
+    /// `- [/]` half done
+    HalfDone,
+    /// `- [+]` add
+    Add,
+    /// `- [R]` research
+    Research,
+    /// `- [!]` important
+    Important,
+    /// `- [i]` idea
+    Idea,
+    /// `- [B]` brainstorm
+    Brainstorm,
+    /// `- [P]` pro
+    Pro,
+    /// `- [C]` con
+    Con,
+    /// `- [Q]` quote
+    Quote,
+    /// `- [N]` note
+    Note,
+    /// `- [b]` bookmark
+    Bookmark,
+    /// `- [I]` information
+    Information,
+    /// `- [p]` paraphrase
+    Paraphrase,
+    /// `- [L]` location
+    Location,
+    /// `- [E]` example
+    Example,
+    /// `- [A]` answer
+    Answer,
+    /// `- [r]` reward
+    Reward,
+    /// `- [c]` choice
+    Choice,
+    /// `- [d]` doing
+    Doing,
+    /// `- [T]` time
+    Time,
+    /// `- [@]` character / person
+    Character,
+    /// `- [t]` talk
+    Talk,
+    /// `- [O]` outline / plot
+    Outline,
+    /// `- [~]` conflict
+    Conflict,
+    /// `- [W]` world
+    World,
+    /// `- [f]` clue / find
+    Clue,
+    /// `- [F]` foreshadow
+    Foreshadow,
+    /// `- [H]` favorite / health
+    Favorite,
+    /// `- [&]` symbolism
+    Symbolism,
+    /// `- [s]` secret
+    Secret,
+
+    /// Any `[char]` not matching the 35 ITS Theme markers. Stores the original char.
+    LooselyChecked(char),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -434,6 +506,65 @@ fn its_theme_kind(type_str: &str) -> Option<BlockQuoteKind> {
     }
 }
 
+/// Extracts an ITS Theme task marker from the start of a text string.
+///
+/// Matches the pattern `[char]` at the start of `text` (after optional whitespace), where `char`
+/// is exactly one character. Returns `Some((ItemKind, remaining_text))` where `remaining_text` is
+/// the text after the marker. Returns `None` if no `[char]` pattern is found.
+///
+/// Case-sensitive: `[C]` (Con) is distinct from `[c]` (Choice).
+fn extract_its_item_kind(text: &str) -> Option<(ItemKind, String)> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let marker_char = chars.next()?;
+    let after_char = chars.as_str();
+    let after_bracket = after_char.strip_prefix(']')?;
+
+    let kind = match marker_char {
+        '-' => ItemKind::Dropped,
+        '>' => ItemKind::Forward,
+        '<' => ItemKind::Migrated,
+        'D' => ItemKind::Date,
+        '?' => ItemKind::Question,
+        '/' => ItemKind::HalfDone,
+        '+' => ItemKind::Add,
+        'R' => ItemKind::Research,
+        '!' => ItemKind::Important,
+        'i' => ItemKind::Idea,
+        'B' => ItemKind::Brainstorm,
+        'P' => ItemKind::Pro,
+        'C' => ItemKind::Con,
+        'Q' => ItemKind::Quote,
+        'N' => ItemKind::Note,
+        'b' => ItemKind::Bookmark,
+        'I' => ItemKind::Information,
+        'p' => ItemKind::Paraphrase,
+        'L' => ItemKind::Location,
+        'E' => ItemKind::Example,
+        'A' => ItemKind::Answer,
+        'r' => ItemKind::Reward,
+        'c' => ItemKind::Choice,
+        'd' => ItemKind::Doing,
+        'T' => ItemKind::Time,
+        '@' => ItemKind::Character,
+        't' => ItemKind::Talk,
+        'O' => ItemKind::Outline,
+        '~' => ItemKind::Conflict,
+        'W' => ItemKind::World,
+        'f' => ItemKind::Clue,
+        'F' => ItemKind::Foreshadow,
+        'H' => ItemKind::Favorite,
+        '&' => ItemKind::Symbolism,
+        's' => ItemKind::Secret,
+        // Unknown char: LooselyChecked fallback stores the original char
+        c => ItemKind::LooselyChecked(c),
+    };
+
+    let remaining = after_bracket.strip_prefix(' ').unwrap_or(after_bracket).to_string();
+    Some((kind, remaining))
+}
+
 /// A parser that consumes [`pulldown_cmark::Event`]s and produces a [`Vec`] of [`Node`].
 ///
 /// # Examples
@@ -663,7 +794,40 @@ impl<'a> Parser<'a> {
         match event {
             Event::Start(tag) => self.tag(tag, range),
             Event::End(tag_end) => self.tag_end(tag_end),
-            Event::Text(text) => self.push_text_node(TextNode::new(text.to_string(), None)),
+            Event::Text(text) => {
+                // ITS Theme task marker detection: only on the very first text of an Item node
+                // whose kind is still None (no TaskListMarker fired yet) and text is empty (D-05, D-06).
+                let its_detected = if let Some(Node {
+                    markdown_node: MarkdownNode::Item { kind: None, text: ref item_text },
+                    ..
+                }) = self.current_node
+                {
+                    if item_text.0.is_empty() {
+                        extract_its_item_kind(&text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((item_kind, remaining)) = its_detected {
+                    // Set the kind on the current Item node (D-08: strip marker from text)
+                    if let Some(Node {
+                        markdown_node: MarkdownNode::Item { ref mut kind, .. },
+                        ..
+                    }) = self.current_node
+                    {
+                        *kind = Some(item_kind);
+                    }
+                    // Only push remaining text if non-empty
+                    if !remaining.is_empty() {
+                        self.push_text_node(TextNode::new(remaining, None));
+                    }
+                } else {
+                    self.push_text_node(TextNode::new(text.to_string(), None));
+                }
+            }
             Event::Code(text) => {
                 self.push_text_node(TextNode::new(text.to_string(), Some(Style::Code)))
             }
@@ -1031,5 +1195,89 @@ mod tests {
 
         let (kind, _, _, _) = parse_blockquote_semantics("> [!caution]\n> body");
         assert_eq!(kind, Some(BlockQuoteKind::Caution));
+    }
+
+    #[test]
+    fn test_extract_its_item_kind_known() {
+        assert_eq!(
+            extract_its_item_kind("[>] Forward"),
+            Some((ItemKind::Forward, "Forward".to_string()))
+        );
+        assert_eq!(
+            extract_its_item_kind("[!] Important"),
+            Some((ItemKind::Important, "Important".to_string()))
+        );
+        assert_eq!(
+            extract_its_item_kind("[C] Con"),
+            Some((ItemKind::Con, "Con".to_string()))
+        );
+        assert_eq!(
+            extract_its_item_kind("[c] Choice"),
+            Some((ItemKind::Choice, "Choice".to_string()))
+        );
+        assert_eq!(
+            extract_its_item_kind("[-] Dropped"),
+            Some((ItemKind::Dropped, "Dropped".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_its_item_kind_loosely_checked() {
+        assert_eq!(
+            extract_its_item_kind("[z] Unknown"),
+            Some((ItemKind::LooselyChecked('z'), "Unknown".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_its_item_kind_no_match() {
+        assert_eq!(extract_its_item_kind("plain text"), None);
+        assert_eq!(extract_its_item_kind("[no closing"), None);
+        // Multi-char inside brackets is not a single-char pattern
+        assert_eq!(extract_its_item_kind("[ab] text"), None);
+    }
+
+    #[test]
+    fn test_parse_its_theme_task_items() {
+        let md = "- [>] Forwarded item\n- [!] Important item\n- [c] Choice item\n";
+        let nodes = from_str(md);
+        // pulldown-cmark emits a List node wrapping Item nodes.
+        // In basalt-core, each list item emits separately as MarkdownNode::Item.
+        // Check that ITS Theme items are recognized with correct kind.
+        let task_items: Vec<_> = nodes
+            .iter()
+            .filter_map(|n| {
+                if let MarkdownNode::Item { kind, .. } = &n.markdown_node {
+                    Some(kind.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(task_items.len(), 3, "expected 3 task items");
+        assert_eq!(task_items[0], Some(ItemKind::Forward));
+        assert_eq!(task_items[1], Some(ItemKind::Important));
+        assert_eq!(task_items[2], Some(ItemKind::Choice));
+    }
+
+    #[test]
+    fn test_standard_markers_unaffected_in_core() {
+        // Standard [x] and [ ] still use HardChecked / Unchecked
+        let md = "- [x] Done\n- [ ] Todo\n";
+        let nodes = from_str(md);
+        let kinds: Vec<_> = nodes
+            .iter()
+            .filter_map(|n| {
+                if let MarkdownNode::Item { kind, .. } = &n.markdown_node {
+                    Some(kind.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds[0], Some(ItemKind::HardChecked));
+        assert_eq!(kinds[1], Some(ItemKind::Unchecked));
     }
 }

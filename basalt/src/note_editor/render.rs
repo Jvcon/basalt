@@ -483,18 +483,36 @@ pub fn task<'a>(
                 RenderStyle::Raw => content.to_string(),
             };
             let (marker, text) = match kind {
+                // Standard markers — use existing symbols fields (D-11)
                 ast::TaskKind::Unchecked => (
                     format!("{} ", symbols.task_unchecked).dark_gray(),
                     text.into(),
-                ),
-                ast::TaskKind::LooselyChecked => (
-                    format!("{} ", symbols.task_checked).magenta(),
-                    text.dark_gray(),
                 ),
                 ast::TaskKind::Checked => (
                     format!("{} ", symbols.task_checked).magenta(),
                     text.dark_gray().add_modifier(Modifier::CROSSED_OUT),
                 ),
+
+                // Unknown marker — render original [char] in dark_gray (D-16)
+                ast::TaskKind::LooselyChecked(c) => (
+                    format!("[{}] ", c).dark_gray(),
+                    text.into(),
+                ),
+
+                // ITS Theme markers — delegate to task_style() for icon + color (D-13, D-14, D-15)
+                its_kind => {
+                    let (color, ascii, unicode, nerdfont) = task_style(its_kind);
+                    let icon = match symbols.preset {
+                        crate::config::Preset::Ascii => ascii,
+                        crate::config::Preset::NerdFont => nerdfont,
+                        // Unicode and Auto both use unicode icons
+                        _ => unicode,
+                    };
+                    (
+                        format!("{} ", icon).fg(color),
+                        text.into(), // ITS Theme markers do NOT strike-through text (D-15)
+                    )
+                }
             };
 
             let mut lines = text_wrap(
@@ -858,6 +876,76 @@ fn callout_icon(kind: &ast::BlockQuoteKind, preset: &crate::config::Preset) -> &
     }
 }
 
+/// Returns `(color, ascii_icon, unicode_icon, nerdfont_icon)` for an ITS Theme task marker.
+///
+/// Standard variants (`Checked`, `Unchecked`) and `LooselyChecked` are handled directly
+/// in `task()` and must not be passed here.
+fn task_style(kind: &ast::TaskKind) -> (Color, &'static str, &'static str, &'static str) {
+    use ast::TaskKind::*;
+    // (color, ascii_icon, unicode_icon, nerdfont_icon)
+    match kind {
+        // Navigation / Time (cool tones — Cyan family)
+        Forward => (Color::Cyan, "[>]", "\u{25b6}", "\u{f0da}"),     // nf-fa-caret_right
+        Migrated => (Color::LightCyan, "[<]", "\u{25c0}", "\u{f0d9}"), // nf-fa-caret_left
+        Date => (Color::Cyan, "[D]", "\u{1f4c5}", "\u{f073}"),        // nf-fa-calendar
+        Time => (Color::LightCyan, "[T]", "\u{231a}", "\u{f017}"),    // nf-fa-clock_o
+        Dropped => (Color::DarkGray, "[-]", "\u{2717}", "\u{f00d}"),  // nf-fa-times
+
+        // Status / Completion (amber / muted tones)
+        HalfDone => (Color::Yellow, "[/]", "\u{25d1}", "\u{f111}"),   // nf-fa-circle (half)
+        Doing => (Color::LightYellow, "[d]", "\u{21bb}", "\u{f110}"), // nf-fa-spinner
+
+        // Importance / Action (warm tones — Red/Orange family)
+        Important => (Color::Red, "[!]", "\u{26a0}", "\u{f071}"),     // nf-fa-warning
+        Add => (Color::LightRed, "[+]", "\u{ff0b}", "\u{f067}"),      // nf-fa-plus
+        Pro => (Color::LightGreen, "[P]", "\u{2714}", "\u{f00c}"),    // nf-fa-check
+        Con => (Color::Red, "[C]", "\u{2718}", "\u{f00d}"),           // nf-fa-times (distinct from Dropped by color)
+
+        // Knowledge / Research (blue / purple family)
+        Research => (Color::Blue, "[R]", "\u{2315}", "\u{f002}"),     // nf-fa-search
+        Information => (Color::LightBlue, "[I]", "\u{2139}", "\u{f05a}"), // nf-fa-info_circle
+        Idea => (Color::Magenta, "[i]", "\u{2605}", "\u{f0eb}"),      // nf-fa-lightbulb_o (star, distinct from Favorite)
+        Brainstorm => (Color::LightMagenta, "[B]", "\u{26a1}", "\u{f0e7}"), // nf-fa-bolt
+
+        // Writing / Reference (neutral / green family)
+        Quote => (Color::Green, "[Q]", "\u{275d}", "\u{f10d}"),       // nf-fa-quote_left
+        Note => (Color::LightGreen, "[N]", "\u{270e}", "\u{f249}"),   // nf-fa-sticky_note_o
+        Talk => (Color::Green, "[t]", "\u{2709}", "\u{f075}"),        // nf-fa-comment (envelope as chat)
+        Paraphrase => (Color::LightGreen, "[p]", "\u{21a9}", "\u{f064}"), // nf-fa-share
+
+        // Creative / Story (magenta / dark family)
+        World => (Color::Magenta, "[W]", "\u{2316}", "\u{f0ac}"),     // nf-fa-globe (crosshair)
+        Outline => (Color::LightMagenta, "[O]", "\u{2261}", "\u{f0cb}"), // nf-fa-list_ol (triple bar)
+        Foreshadow => (Color::Magenta, "[F]", "\u{2691}", "\u{f024}"), // nf-fa-flag (distinct from World by icon)
+        Clue => (Color::LightMagenta, "[f]", "\u{2318}", "\u{f002}"), // nf-fa-search (command symbol, distinct)
+
+        // Decision / Judgment (yellow / teal family)
+        Question => (Color::Yellow, "[?]", "\u{2753}", "\u{f128}"),   // nf-fa-question
+        Answer => (Color::LightYellow, "[A]", "\u{2713}", "\u{f00c}"), // nf-fa-check (distinct from Pro by color)
+        Choice => (Color::Cyan, "[c]", "\u{25ce}", "\u{f192}"),       // nf-fa-dot_circle_o
+
+        // Person / Place (earth tones)
+        Character => (Color::Rgb(210, 140, 80), "[@]", "\u{25cf}", "\u{f007}"), // nf-fa-user
+        Location => (Color::Rgb(180, 120, 60), "[L]", "\u{25b2}", "\u{f041}"),  // nf-fa-map_marker
+
+        // Content / Meta (green family)
+        Example => (Color::Green, "[E]", "\u{25b8}", "\u{f0a4}"),     // nf-fa-hand_o_right
+        Bookmark => (Color::LightGreen, "[b]", "\u{25c6}", "\u{f02e}"), // nf-fa-bookmark
+        Reward => (Color::LightGreen, "[r]", "\u{2605}", "\u{f091}"), // nf-fa-trophy (star, distinct from Idea by color)
+
+        // Emotion / Symbol (bright / varied)
+        Conflict => (Color::Red, "[~]", "\u{2717}", "\u{f0e7}"),      // nf-fa-bolt (distinct from Con by icon)
+        Favorite => (Color::LightYellow, "[H]", "\u{2665}", "\u{f005}"), // nf-fa-star (heart, distinct)
+        Symbolism => (Color::LightMagenta, "[&]", "\u{221e}", "\u{221e}"), // infinity symbol
+        Secret => (Color::DarkGray, "[s]", "\u{1f512}", "\u{f023}"),  // nf-fa-lock
+
+        // These variants are handled directly in task() — must not reach here
+        Checked | Unchecked | LooselyChecked(_) => {
+            unreachable!("Checked/Unchecked/LooselyChecked handled in task() directly")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,5 +1163,47 @@ mod tests {
         );
 
         insta::assert_snapshot!(virtual_block_to_string(&block));
+    }
+
+    // Test that all 35 ITS Theme TaskKind variants have unique icon+color combinations
+    #[test]
+    fn test_task_style_no_duplicates() {
+        use ast::TaskKind::*;
+        let all_kinds = [
+            Dropped, Forward, Migrated, Date, Question, HalfDone, Add, Research, Important, Idea,
+            Brainstorm, Pro, Con, Quote, Note, Bookmark, Information, Paraphrase, Location,
+            Example, Answer, Reward, Choice, Doing, Time, Character, Talk, Outline, Conflict,
+            World, Clue, Foreshadow, Favorite, Symbolism, Secret,
+        ];
+        let styles: Vec<_> = all_kinds.iter().map(task_style).collect();
+        // All NerdFont icon+color pairs should be unique (no two markers look identical)
+        let pairs: std::collections::HashSet<_> = styles
+            .iter()
+            .map(|(color, _, _, nf)| (format!("{:?}", color), *nf))
+            .collect();
+        assert_eq!(
+            pairs.len(),
+            all_kinds.len(),
+            "duplicate icon+color combination detected"
+        );
+    }
+
+    // Test that task_style returns distinct colors for visually important pairs
+    #[test]
+    fn test_task_style_key_variants() {
+        let (forward_color, _, _, _) = task_style(&ast::TaskKind::Forward);
+        assert_eq!(forward_color, Color::Cyan);
+
+        let (important_color, _, _, _) = task_style(&ast::TaskKind::Important);
+        assert_eq!(important_color, Color::Red);
+
+        let (con_color, _, _, _) = task_style(&ast::TaskKind::Con);
+        let (choice_color, _, _, _) = task_style(&ast::TaskKind::Choice);
+        // Con (red) and Choice (cyan) must be distinct
+        assert_ne!(
+            format!("{:?}", con_color),
+            format!("{:?}", choice_color),
+            "Con and Choice should have different colors"
+        );
     }
 }
