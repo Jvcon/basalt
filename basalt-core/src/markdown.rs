@@ -67,6 +67,30 @@ pub enum Style {
     Strong,
 }
 
+/// Column alignment extracted from the `---` separator row of a GFM table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Alignment {
+    /// `:---` — left-aligned
+    Left,
+    /// `:---:` — center-aligned
+    Center,
+    /// `---:` — right-aligned
+    Right,
+    /// `---` — no colons, treated as Left at render time
+    None,
+}
+
+impl From<pulldown_cmark::Alignment> for Alignment {
+    fn from(value: pulldown_cmark::Alignment) -> Self {
+        match value {
+            pulldown_cmark::Alignment::Left => Alignment::Left,
+            pulldown_cmark::Alignment::Center => Alignment::Center,
+            pulldown_cmark::Alignment::Right => Alignment::Right,
+            pulldown_cmark::Alignment::None => Alignment::None,
+        }
+    }
+}
+
 /// Represents the variant of a list or task item (checked, unchecked, or an ITS Theme marker).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemKind {
@@ -388,6 +412,8 @@ impl Node {
                     last_node.push_text_node(node);
                 }
             }
+            // Table text is accumulated via Parser.table_current_cell, not the node directly.
+            MarkdownNode::Table { .. } => {}
         }
     }
 }
@@ -429,6 +455,14 @@ pub enum MarkdownNode {
         kind: Option<ItemKind>,
         text: Text,
     },
+    /// A GFM table node with column alignments, header row, and body rows.
+    Table {
+        alignments: Vec<Alignment>,
+        /// Header row cells (one Text per column).
+        header: Vec<Text>,
+        /// Body rows; each inner Vec has one Text per column.
+        rows: Vec<Vec<Text>>,
+    },
 }
 
 /// Returns `true` if the [`MarkdownNode`] should be closed upon encountering the given [`TagEnd`].
@@ -440,6 +474,7 @@ fn matches_tag_end(node: &Node, tag_end: &TagEnd) -> bool {
             | (MarkdownNode::BlockQuote { .. }, TagEnd::BlockQuote(..))
             | (MarkdownNode::CodeBlock { .. }, TagEnd::CodeBlock)
             | (MarkdownNode::Item { .. }, TagEnd::Item)
+            | (MarkdownNode::Table { .. }, TagEnd::Table)
     )
 }
 
@@ -597,6 +632,10 @@ pub struct Parser<'a> {
     pub output: Vec<Node>,
     inner: pulldown_cmark::TextMergeWithOffset<'a, pulldown_cmark::OffsetIter<'a>>,
     current_node: Option<Node>,
+    // Table accumulation state — valid only while current_node is MarkdownNode::Table
+    table_in_header: bool,
+    table_current_row: Vec<Text>,
+    table_current_cell: Text,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -622,6 +661,9 @@ impl<'a> Parser<'a> {
             inner: parser,
             output: vec![],
             current_node: None,
+            table_in_header: false,
+            table_current_row: Vec::new(),
+            table_current_cell: Text::default(),
         }
     }
 
@@ -689,14 +731,35 @@ impl<'a> Parser<'a> {
                 },
                 range,
             )),
+            Tag::Table(alignments_raw) => {
+                self.push_node(Node::new(
+                    MarkdownNode::Table {
+                        alignments: alignments_raw.iter().copied().map(Alignment::from).collect(),
+                        header: vec![],
+                        rows: vec![],
+                    },
+                    range,
+                ));
+                self.table_in_header = false;
+                self.table_current_row = Vec::new();
+                self.table_current_cell = Text::default();
+            }
+            Tag::TableHead => {
+                self.table_in_header = true;
+                self.table_current_row = Vec::new();
+                self.table_current_cell = Text::default();
+            }
+            Tag::TableRow => {
+                self.table_current_row = Vec::new();
+                self.table_current_cell = Text::default();
+            }
+            Tag::TableCell => {
+                self.table_current_cell = Text::default();
+            }
             // For now everything below this comment are defined as paragraph nodes
             Tag::HtmlBlock
             | Tag::List(_)
             | Tag::FootnoteDefinition(_)
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::Emphasis
             | Tag::Strong
             | Tag::Strikethrough
@@ -782,6 +845,51 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Table cell/row/head end processing.
+        //
+        // pulldown-cmark 0.13 table event structure (same as basalt-tui parser):
+        //   Start(Table) → Start(TableHead) → Start(TableCell)...End(TableCell) → End(TableHead)
+        //   → Start(TableRow) → Start(TableCell)...End(TableCell) → End(TableRow) → End(Table)
+        // Note: TableHead contains TableCells directly (no TableRow wrapper inside TableHead).
+        match &tag_end {
+            TagEnd::TableCell => {
+                if let Some(Node {
+                    markdown_node: MarkdownNode::Table { .. },
+                    ..
+                }) = Some(&node)
+                {
+                    let cell = std::mem::take(&mut self.table_current_cell);
+                    self.table_current_row.push(cell);
+                }
+                self.current_node = Some(node);
+                return;
+            }
+            TagEnd::TableHead => {
+                if let Some(Node {
+                    markdown_node: MarkdownNode::Table { ref mut header, .. },
+                    ..
+                }) = Some(&mut node)
+                {
+                    *header = std::mem::take(&mut self.table_current_row);
+                }
+                self.table_in_header = false;
+                self.current_node = Some(node);
+                return;
+            }
+            TagEnd::TableRow => {
+                if let Some(Node {
+                    markdown_node: MarkdownNode::Table { ref mut rows, .. },
+                    ..
+                }) = Some(&mut node)
+                {
+                    rows.push(std::mem::take(&mut self.table_current_row));
+                }
+                self.current_node = Some(node);
+                return;
+            }
+            _ => {}
+        }
+
         if matches_tag_end(&node, &tag_end) {
             self.output.push(node);
         } else {
@@ -795,6 +903,15 @@ impl<'a> Parser<'a> {
             Event::Start(tag) => self.tag(tag, range),
             Event::End(tag_end) => self.tag_end(tag_end),
             Event::Text(text) => {
+                // Table cell text: accumulate into table_current_cell, not the node directly.
+                if matches!(
+                    self.current_node,
+                    Some(Node { markdown_node: MarkdownNode::Table { .. }, .. })
+                ) {
+                    self.table_current_cell.push(TextNode::new(text.to_string(), None));
+                    return;
+                }
+
                 // ITS Theme task marker detection: only on the very first text of an Item node
                 // whose kind is still None (no TaskListMarker fired yet) and text is empty (D-05, D-06).
                 let its_detected = if let Some(Node {
@@ -829,6 +946,15 @@ impl<'a> Parser<'a> {
                 }
             }
             Event::Code(text) => {
+                // Table cell code: accumulate into table_current_cell with Code style.
+                if matches!(
+                    self.current_node,
+                    Some(Node { markdown_node: MarkdownNode::Table { .. }, .. })
+                ) {
+                    self.table_current_cell
+                        .push(TextNode::new(text.to_string(), Some(Style::Code)));
+                    return;
+                }
                 self.push_text_node(TextNode::new(text.to_string(), Some(Style::Code)))
             }
             Event::TaskListMarker(checked) => {

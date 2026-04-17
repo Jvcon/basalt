@@ -456,6 +456,7 @@ mod tests {
                     &Symbols::unicode(),
                     0,
                     None, // Tests don't need syntax highlighting
+                    0,    // No table h_scroll in tests
                 )
                 .lines
             })
@@ -701,6 +702,7 @@ mod tests {
                     &Symbols::unicode(),
                     0,
                     None, // Tests don't need syntax highlighting
+                    0,    // No table h_scroll in tests
                 )
                 .lines
             })

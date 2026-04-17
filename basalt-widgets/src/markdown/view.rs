@@ -211,6 +211,8 @@ impl MarkdownView {
 
                 lines
             }
+            // Table rendering is implemented in plan 06-02; return empty for now.
+            markdown::MarkdownNode::Table { .. } => vec![],
         }
     }
 }

@@ -39,6 +39,283 @@ pub enum RenderStyle {
     Visual,
 }
 
+/// Table border characters for the ASCII preset.
+/// Layout: (top_left, top_mid, top_right, mid_left, mid_mid, mid_right,
+///          bot_left, bot_mid, bot_right, h_line, v_line)
+const TABLE_BORDERS_ASCII: (
+    &str, &str, &str,
+    &str, &str, &str,
+    &str, &str, &str,
+    &str, &str,
+) = (
+    "+", "+", "+",   // top: left, mid (column sep), right
+    "+", "+", "+",   // header-body separator: left, mid, right
+    "+", "+", "+",   // bottom: left, mid, right
+    "-",             // horizontal line char
+    "|",             // vertical line char
+);
+
+/// Table border characters for Unicode/NerdFont presets.
+const TABLE_BORDERS_UNICODE: (
+    &str, &str, &str,
+    &str, &str, &str,
+    &str, &str, &str,
+    &str, &str,
+) = (
+    "┌", "┬", "┐",
+    "├", "┼", "┤",
+    "└", "┴", "┘",
+    "─",
+    "│",
+);
+
+fn table_borders(
+    preset: &crate::config::Preset,
+) -> (
+    &'static str, &'static str, &'static str,
+    &'static str, &'static str, &'static str,
+    &'static str, &'static str, &'static str,
+    &'static str, &'static str,
+) {
+    use crate::config::Preset;
+    match preset {
+        Preset::Ascii => TABLE_BORDERS_ASCII,
+        _ => TABLE_BORDERS_UNICODE, // Unicode and NerdFont both use box-drawing
+    }
+}
+
+fn rich_text_display_width(rt: &RichText) -> usize {
+    let s: String = rt.segments().iter().map(|seg| seg.to_string()).collect();
+    s.width().max(1) // minimum width 1 so empty cells have a column
+}
+
+/// Convert a [`RichText`] into styled [`Span`]s, applying appropriate ratatui styles.
+#[allow(dead_code)]
+fn rich_text_to_spans<'a>(rt: &RichText) -> Vec<Span<'a>> {
+    rt.segments()
+        .iter()
+        .map(|seg| {
+            let style = match &seg.style {
+                Some(crate::note_editor::rich_text::Style::Strong) => {
+                    Style::default().add_modifier(Modifier::BOLD)
+                }
+                Some(crate::note_editor::rich_text::Style::Emphasis) => {
+                    Style::default().add_modifier(Modifier::ITALIC)
+                }
+                Some(crate::note_editor::rich_text::Style::Strikethrough) => {
+                    Style::default().add_modifier(Modifier::CROSSED_OUT)
+                }
+                Some(crate::note_editor::rich_text::Style::Code) => {
+                    Style::default().fg(Color::Yellow)
+                }
+                Some(crate::note_editor::rich_text::Style::InlineMath) => {
+                    Style::default().fg(Color::Cyan)
+                }
+                None => Style::default(),
+            };
+            Span::styled(seg.content.clone(), style)
+        })
+        .collect()
+}
+
+/// Scroll indicators for horizontally scrolled tables (D-14, D-15).
+const INDICATOR_LEFT: &str = "◀";
+const INDICATOR_RIGHT: &str = "▶";
+
+/// Clip a full row string to the visible window determined by `h_scroll` and `max_width`,
+/// returning the visible slice as a `String`.
+///
+/// `h_scroll` is the number of display-width chars to skip from the left.
+/// The result is at most `max_width` display-width chars wide.
+fn clip_row_str(full: &str, h_scroll: usize, max_width: usize) -> String {
+    let mut chars_out = String::new();
+    let mut display_pos: usize = 0;
+    let mut visible_w: usize = 0;
+    for ch in full.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let next_pos = display_pos + cw;
+        if next_pos <= h_scroll {
+            // Entirely before the window — skip
+            display_pos = next_pos;
+            continue;
+        }
+        if display_pos < h_scroll {
+            // Partially before the window — replace with spaces to preserve alignment
+            let visible_part = next_pos - h_scroll;
+            let fill = " ".repeat(visible_part);
+            if visible_w + visible_part > max_width {
+                break;
+            }
+            chars_out.push_str(&fill);
+            visible_w += visible_part;
+            display_pos = next_pos;
+            continue;
+        }
+        // Fully within or after the window
+        if visible_w + cw > max_width {
+            break;
+        }
+        chars_out.push(ch);
+        visible_w += cw;
+        display_pos = next_pos;
+    }
+    chars_out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn table<'a>(
+    alignments: &[ast::Alignment],
+    header: &[RichText],
+    rows: &[Vec<RichText>],
+    source_range: &SourceRange<usize>,
+    max_width: usize,
+    option: &RenderStyle,
+    symbols: &Symbols,
+    h_scroll: usize,
+) -> VirtualBlock<'a> {
+    if *option == RenderStyle::Raw {
+        return VirtualBlock::new(&[], source_range);
+    }
+
+    // Pass 1 — compute column widths
+    let n_cols = header
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    let col_widths: Vec<usize> = (0..n_cols)
+        .map(|i| {
+            let hdr_w = header.get(i).map(rich_text_display_width).unwrap_or(1);
+            let body_w = rows
+                .iter()
+                .map(|row| row.get(i).map(rich_text_display_width).unwrap_or(1))
+                .max()
+                .unwrap_or(1);
+            hdr_w.max(body_w)
+        })
+        .collect();
+
+    // Total display width of the full table:
+    // left_border(1) + for each col: h_line*(col_w+2) + separator(1) * (n-1) + right_border(1)
+    // = 1 + sum(col_w + 2) + (n_cols - 1) + 1
+    // = 2 + sum(col_w + 2) + (n_cols - 1)  [if n_cols > 0]
+    let total_table_w: usize = if n_cols == 0 {
+        2 // just left + right border
+    } else {
+        1 + col_widths.iter().map(|w| w + 2).sum::<usize>() + (n_cols - 1) + 1
+    };
+
+    let show_left = h_scroll > 0;
+    let show_right = h_scroll + max_width < total_table_w;
+
+    // Border selection
+    let (tl, tm, tr, ml, mm, mr, bl, bm, br, h, v) = table_borders(&symbols.preset);
+
+    // Build the full horizontal rule string (without clipping), then clip it.
+    let build_h_rule_str = |left: &str, mid: &str, right: &str| -> String {
+        let mut s = String::from(left);
+        for (i, &w) in col_widths.iter().enumerate() {
+            s.push_str(&h.repeat(w + 2));
+            if i + 1 < col_widths.len() {
+                s.push_str(mid);
+            }
+        }
+        s.push_str(right);
+        s
+    };
+
+    // Helper: apply scroll indicators to a mutable Vec<char> representation of a clipped row.
+    // `show_left` → replace char at index 0 with ◀
+    // `show_right` → replace last char with ▶
+    let apply_indicators = |s: &str| -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.is_empty() {
+            return s.to_string();
+        }
+        let mut out = chars.clone();
+        if show_left && !out.is_empty() {
+            // Replace first character (the left border) with ◀
+            out[0] = INDICATOR_LEFT.chars().next().unwrap_or('◀');
+        }
+        if show_right && !out.is_empty() {
+            // Replace last character (the right border) with ▶
+            let last = out.len() - 1;
+            out[last] = INDICATOR_RIGHT.chars().next().unwrap_or('▶');
+        }
+        out.iter().collect()
+    };
+
+    // Helper: build a clipped + indicator-applied horizontal rule line
+    let h_rule = |left: &str, mid: &str, right: &str| -> VirtualLine {
+        let full = build_h_rule_str(left, mid, right);
+        let clipped = clip_row_str(&full, h_scroll, max_width);
+        let with_ind = apply_indicators(&clipped);
+        VirtualLine::new(&[synthetic_span!(Span::raw(with_ind))])
+    };
+
+    // Helper: build a cell row (header or body) with h_scroll clipping and indicators.
+    // Strategy: build the full row as a string (for clipping), then emit as a single synthetic
+    // span for the border/padding chars — cell content becomes part of the string.
+    // This is acceptable since table cells are typically short and are already synthetic_span.
+    let cell_row = |cells: &[RichText], bold: bool| -> VirtualLine {
+        // Build full row string
+        let mut full = String::from(v);
+        for (i, cell) in cells.iter().enumerate() {
+            let align = alignments.get(i).copied().unwrap_or(ast::Alignment::None);
+            let cell_w = col_widths.get(i).copied().unwrap_or(1);
+            let cell_str: String = cell.segments().iter().map(|s| s.to_string()).collect();
+            let display_w = cell_str.width();
+            let pad = cell_w.saturating_sub(display_w);
+            let (left_pad, right_pad) = match align {
+                ast::Alignment::Right => (pad, 0),
+                ast::Alignment::Center => {
+                    let lp = pad / 2;
+                    (lp, pad - lp)
+                }
+                _ => (0, pad), // Left / None
+            };
+            full.push(' ');
+            full.push_str(&" ".repeat(left_pad));
+            full.push_str(&cell_str);
+            full.push_str(&" ".repeat(right_pad));
+            full.push(' ');
+            if i + 1 < cells.len() {
+                full.push_str(v);
+            }
+        }
+        // Handle rows with fewer cells than n_cols
+        for i in cells.len()..n_cols {
+            let cell_w = col_widths.get(i).copied().unwrap_or(1);
+            full.push_str(v);
+            full.push_str(&" ".repeat(cell_w + 2));
+        }
+        full.push_str(v);
+
+        // Apply h_scroll clipping
+        let clipped = clip_row_str(&full, h_scroll, max_width);
+        let with_ind = apply_indicators(&clipped);
+
+        // Emit as a single styled span (bold modifier for header)
+        let span = if bold {
+            Span::styled(with_ind, Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw(with_ind)
+        };
+        VirtualLine::new(&[synthetic_span!(span)])
+    };
+
+    // Assemble lines
+    let mut lines = vec![
+        h_rule(tl, tm, tr),      // top border
+        cell_row(header, true),  // header (bold)
+        h_rule(ml, mm, mr),      // header-body separator
+    ];
+    for row in rows {
+        lines.push(cell_row(row, false));
+    }
+    lines.push(h_rule(bl, bm, br)); // bottom border
+
+    VirtualBlock::new(&lines, source_range)
+}
+
 // Internal consolidated text wrapping function
 // FIXME: Use options struct or similar
 #[allow(clippy::too_many_arguments)]
@@ -439,6 +716,7 @@ pub fn list<'a>(
                         symbols,
                         list_depth,
                         None,
+                        0, // nested list items are not the active table
                     )
                     .lines
                 })
@@ -535,6 +813,7 @@ pub fn task<'a>(
                     symbols,
                     list_depth + 1,
                     None,
+                    0, // task sub-items are not the active table
                 )
                 .lines
             }));
@@ -604,6 +883,7 @@ pub fn item<'a>(
                     symbols,
                     list_depth + 1,
                     None,
+                    0, // item sub-nodes are not the active table
                 )
                 .lines
             }));
@@ -669,6 +949,7 @@ pub fn block_quote<'a>(
                         symbols,
                         0,
                         None,
+                        0, // block_quote inner nodes are not the active table
                     )
                     .lines;
                     if prefix.to_string().is_empty() && i != nodes.len().saturating_sub(1) {
@@ -700,6 +981,9 @@ pub fn render_node<'a>(
     symbols: &Symbols,
     list_depth: usize,
     syntect_ctx: Option<&SyntectContext>,
+    // Horizontal scroll offset for the active table (D-15). Pass `state.table_h_scroll`
+    // when this node is a table and horizontal scrolling should apply; `0` otherwise.
+    table_h_scroll: usize,
 ) -> VirtualBlock<'a> {
     use ast::Node::*;
     match node {
@@ -798,6 +1082,21 @@ pub fn render_node<'a>(
             max_width,
             option,
             symbols,
+        ),
+        Table {
+            alignments,
+            header,
+            rows,
+            source_range,
+        } => table(
+            alignments,
+            header,
+            rows,
+            source_range,
+            max_width,
+            option,
+            symbols,
+            table_h_scroll,
         ),
     }
 }
@@ -1205,5 +1504,133 @@ mod tests {
             format!("{:?}", choice_color),
             "Con and Choice should have different colors"
         );
+    }
+
+    // --- Table rendering snapshot tests ---
+
+    fn render_table_to_string(md: &str, symbols: &Symbols) -> String {
+        use crate::note_editor::parser;
+        let nodes = parser::from_str(md);
+        let table_node = nodes
+            .iter()
+            .find(|n| matches!(n, ast::Node::Table { .. }))
+            .expect("no table node found in parsed markdown");
+        if let ast::Node::Table {
+            alignments,
+            header,
+            rows,
+            source_range,
+        } = table_node
+        {
+            let block = table(
+                alignments,
+                header,
+                rows,
+                source_range,
+                80,
+                &RenderStyle::Visual,
+                symbols,
+                0, // h_scroll = 0 for standard rendering
+            );
+            virtual_block_to_string(&block)
+        } else {
+            panic!("expected Table node");
+        }
+    }
+
+    #[test]
+    fn table_ascii_preset() {
+        let md = "| Name  | Age | City   |\n| :---- | --: | :----: |\n| Alice |  28 | London |\n| Bob   |  34 | Paris  |\n";
+        let s = render_table_to_string(md, &Symbols::ascii());
+        insta::assert_snapshot!("table_ascii", s);
+    }
+
+    #[test]
+    fn table_unicode_preset() {
+        let md = "| Name  | Age | City   |\n| :---- | --: | :----: |\n| Alice |  28 | London |\n| Bob   |  34 | Paris  |\n";
+        let s = render_table_to_string(md, &Symbols::unicode());
+        insta::assert_snapshot!("table_unicode", s);
+    }
+
+    #[test]
+    fn table_unicode_wide_chars() {
+        // CJK chars are width-2, so columns must be wider
+        let md = "| Name | Score |\n| :--- | ----: |\n| 日本  |   100 |\n| 中国  |    99 |\n";
+        let s = render_table_to_string(md, &Symbols::unicode());
+        insta::assert_snapshot!("table_unicode_wide_chars", s);
+    }
+
+    /// Verify that ◀ and ▶ scroll indicators appear when h_scroll > 0 and the table
+    /// extends beyond max_width (D-14, D-15).
+    #[test]
+    fn table_h_scroll_shows_indicators() {
+        use crate::note_editor::parser;
+
+        let md =
+            "| A | B | C | D | E |\n| - | - | - | - | - |\n| 1 | 2 | 3 | 4 | 5 |\n";
+        let nodes = parser::from_str(md);
+        let table_node = nodes
+            .iter()
+            .find(|n| matches!(n, ast::Node::Table { .. }))
+            .expect("no Table node found");
+
+        if let ast::Node::Table {
+            alignments,
+            header,
+            rows,
+            source_range,
+        } = table_node
+        {
+            // h_scroll=4, max_width=12 — content is hidden on both sides, forcing both indicators
+            let block = table(
+                alignments,
+                header,
+                rows,
+                source_range,
+                12,
+                &RenderStyle::Visual,
+                &Symbols::unicode(),
+                4,
+            );
+            // Collect all span text in the first line (top border)
+            // Use spans() which returns Vec<Span<'a>> after consuming the VirtualLine
+            let first_line: String = block.lines[0]
+                .clone()
+                .spans()
+                .iter()
+                .map(|s| s.content.as_ref().to_string())
+                .collect();
+            assert!(
+                first_line.contains('◀'),
+                "expected left scroll indicator ◀ in top border, got: {first_line:?}"
+            );
+            assert!(
+                first_line.contains('▶'),
+                "expected right scroll indicator ▶ in top border, got: {first_line:?}"
+            );
+            // Also verify that h_scroll=0 does NOT show left indicator
+            let block_noscroll = table(
+                alignments,
+                header,
+                rows,
+                source_range,
+                80,
+                &RenderStyle::Visual,
+                &Symbols::unicode(),
+                0,
+            );
+            let first_line_noscroll: String = block_noscroll.lines[0]
+                .clone()
+                .spans()
+                .iter()
+                .map(|s| s.content.as_ref().to_string())
+                .collect();
+            assert!(
+                !first_line_noscroll.contains('◀'),
+                "should not have left indicator when h_scroll=0, got: {first_line_noscroll:?}"
+            );
+        } else {
+            panic!("expected Table node");
+        }
     }
 }

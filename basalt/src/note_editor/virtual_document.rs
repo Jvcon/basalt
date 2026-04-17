@@ -224,6 +224,9 @@ impl<'a> VirtualDocument<'a> {
         ast_nodes: &[ast::Node],
         width: usize,
         text_buffer: Option<TextBuffer>,
+        // Horizontal scroll offset for the currently active table (D-15).
+        // Passed from `NoteEditorState::table_h_scroll` at layout time.
+        table_h_scroll: usize,
     ) {
         if !note_name.is_empty() {
             let note_name = match self.symbols.title_font_style {
@@ -270,6 +273,7 @@ impl<'a> VirtualDocument<'a> {
                         &self.symbols,
                         0,
                         None, // No syntax highlighting in Raw/Edit mode
+                        0,    // Raw/Edit mode: no table scroll
                     )
                 } else {
                     render_node(
@@ -281,6 +285,7 @@ impl<'a> VirtualDocument<'a> {
                         &self.symbols,
                         0,
                         self.syntect_ctx.as_ref(), // Pass syntect context for Visual rendering
+                        table_h_scroll,            // Apply horizontal scroll for tables (D-15)
                     )
                 };
                 let block_lines = block.lines.clone();

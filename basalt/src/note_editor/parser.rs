@@ -84,6 +84,102 @@ impl<'a> Parser<'a> {
         let mut text_segments = Vec::new();
         let mut inline_styles = Vec::new();
 
+        // Table parsing: dedicated accumulation loop that processes all table events
+        // and returns immediately, bypassing the generic event loop below.
+        //
+        // pulldown-cmark 0.13 table event structure:
+        //   Start(Table([alignments]))
+        //     Start(TableHead)
+        //       Start(TableCell) ... End(TableCell)  ← header cells (no TableRow wrapper!)
+        //     End(TableHead)
+        //     Start(TableRow)
+        //       Start(TableCell) ... End(TableCell)
+        //     End(TableRow)
+        //     ...
+        //   End(Table)
+        if let Tag::Table(ref alignments_raw) = tag {
+            let alignments: Vec<ast::Alignment> =
+                alignments_raw.iter().copied().map(ast::Alignment::from).collect();
+            let mut header: Vec<RichText> = Vec::new();
+            let mut rows: Vec<Vec<RichText>> = Vec::new();
+            let mut in_header = false;
+            // current_cells accumulates cells in header (during TableHead) or in a body row
+            let mut current_cells: Vec<RichText> = Vec::new();
+            let mut cell_segments: Vec<TextSegment> = Vec::new();
+            let mut cell_styles: Vec<Style> = Vec::new();
+            let mut source_range = 0..0;
+
+            while let Some((event, range)) = self.next() {
+                match event {
+                    Event::Start(Tag::TableHead) => {
+                        in_header = true;
+                        current_cells = Vec::new();
+                    }
+                    Event::End(TagEnd::TableHead) => {
+                        // Header cells are collected directly (no TableRow wrapper in TableHead)
+                        header = std::mem::take(&mut current_cells);
+                        in_header = false;
+                    }
+                    Event::Start(Tag::TableRow) => {
+                        current_cells = Vec::new();
+                    }
+                    Event::End(TagEnd::TableRow) => {
+                        rows.push(std::mem::take(&mut current_cells));
+                    }
+                    Event::Start(Tag::TableCell) => {
+                        cell_segments = Vec::new();
+                        cell_styles = Vec::new();
+                    }
+                    Event::End(TagEnd::TableCell) => {
+                        let rt = if cell_segments.is_empty() {
+                            RichText::empty()
+                        } else {
+                            RichText::from(std::mem::take(&mut cell_segments))
+                        };
+                        current_cells.push(rt);
+                    }
+                    Event::Text(text) => {
+                        let mut seg = TextSegment::plain(&text);
+                        cell_styles.iter().for_each(|s| seg.add_style(s));
+                        cell_segments.push(seg);
+                    }
+                    Event::Code(text) => {
+                        cell_segments.push(TextSegment::styled(&text, Style::Code));
+                    }
+                    Event::Start(Tag::Emphasis) => {
+                        cell_styles.push(Style::Emphasis);
+                    }
+                    Event::Start(Tag::Strong) => {
+                        cell_styles.push(Style::Strong);
+                    }
+                    Event::Start(Tag::Strikethrough) => {
+                        cell_styles.push(Style::Strikethrough);
+                    }
+                    Event::End(TagEnd::Emphasis) => {
+                        cell_styles.retain(|s| !matches!(s, Style::Emphasis));
+                    }
+                    Event::End(TagEnd::Strong) => {
+                        cell_styles.retain(|s| !matches!(s, Style::Strong));
+                    }
+                    Event::End(TagEnd::Strikethrough) => {
+                        cell_styles.retain(|s| !matches!(s, Style::Strikethrough));
+                    }
+                    Event::End(TagEnd::Table) => {
+                        source_range = range;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            return Some(Node::Table {
+                alignments,
+                header,
+                rows,
+                source_range,
+            });
+        }
+
         match tag {
             Tag::List(Some(start)) => {
                 state.item_kind.push(ast::ItemKind::Ordered(start));
@@ -308,6 +404,7 @@ impl<'a> Parser<'a> {
                 | Tag::BlockQuote(..)
                 | Tag::CodeBlock(..)
                 | Tag::Heading { .. }
+                | Tag::Table(..)
         )
     }
 
@@ -324,6 +421,7 @@ impl<'a> Parser<'a> {
                 Tag::BlockQuote(kind) => Some(TagEnd::BlockQuote(*kind)),
                 Tag::CodeBlock(..) => Some(TagEnd::CodeBlock),
                 Tag::Paragraph => Some(TagEnd::Paragraph),
+                Tag::Table(..) => Some(TagEnd::Table),
                 _ => None,
             }
         }
@@ -815,6 +913,29 @@ mod tests {
             }
         } else {
             panic!("expected List node");
+        }
+    }
+
+    #[test]
+    fn test_parse_table() {
+        let md = indoc! {"
+            | Name  | Age | City   |
+            | :---- | --: | :----: |
+            | Alice |  28 | London |
+            | Bob   |  34 | Paris  |
+        "};
+        let nodes = from_str(md);
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            Node::Table { alignments, header, rows, .. } => {
+                assert_eq!(alignments.len(), 3);
+                assert_eq!(alignments[0], ast::Alignment::Left);
+                assert_eq!(alignments[1], ast::Alignment::Right);
+                assert_eq!(alignments[2], ast::Alignment::Center);
+                assert_eq!(header.len(), 3);
+                assert_eq!(rows.len(), 2);
+            }
+            other => panic!("expected Table, got {:?}", other),
         }
     }
 

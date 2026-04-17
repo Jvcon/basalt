@@ -6,6 +6,7 @@ use std::{
 };
 
 use ratatui::layout::Size;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::SyntectContext,
@@ -69,6 +70,9 @@ pub struct NoteEditorState<'a> {
     /// the layout always matches the text_buffer, even when the cursor
     /// position would temporarily resolve to a different block.
     editing_block: Option<usize>,
+    /// Horizontal scroll offset (in display-width chars) for the currently active table.
+    /// Resets to 0 when the cursor leaves the table's source range (D-13).
+    pub table_h_scroll: usize,
 }
 
 impl<'a> NoteEditorState<'a> {
@@ -98,6 +102,7 @@ impl<'a> NoteEditorState<'a> {
             editor_enabled: false,
             modified: false,
             editing_block: None,
+            table_h_scroll: 0,
         }
     }
 
@@ -302,6 +307,7 @@ impl<'a> NoteEditorState<'a> {
                 &self.ast_nodes,
                 size.width.into(),
                 self.text_buffer.clone(),
+                self.table_h_scroll,
             );
 
             self.viewport.resize(size);
@@ -441,6 +447,7 @@ impl<'a> NoteEditorState<'a> {
             &self.ast_nodes,
             self.viewport.area().width.into(),
             self.text_buffer.clone(),
+            self.table_h_scroll,
         );
 
         self.cursor.update(
@@ -519,6 +526,7 @@ impl<'a> NoteEditorState<'a> {
             &self.ast_nodes,
             self.viewport.area().width.into(),
             self.text_buffer.clone(),
+            self.table_h_scroll,
         );
 
         if let Some(offset) = target_offset {
@@ -567,6 +575,57 @@ impl<'a> NoteEditorState<'a> {
             };
             node.set_source_range(shifted_range);
         });
+    }
+
+    /// Returns a reference to the `Node::Table` the cursor is currently inside, if any.
+    ///
+    /// Uses the cursor's source_offset to test containment within each top-level Table
+    /// node's source range. Tables are never nested (per scope), so a flat scan is correct.
+    pub fn cursor_in_table_node(&self) -> Option<&ast::Node> {
+        let offset = self.cursor.source_offset();
+        self.ast_nodes.iter().find(|node| {
+            matches!(node, ast::Node::Table { .. }) && node.source_range().contains(&offset)
+        })
+    }
+
+    /// Returns the pre-computed column display widths for the table the cursor is currently in.
+    ///
+    /// Replicates Pass 1 from `render.rs` to compute the same column widths used at render
+    /// time, enabling H/L column-width scroll jumps without re-rendering.
+    pub fn table_col_widths(&self) -> Option<Vec<usize>> {
+        if let Some(ast::Node::Table { header, rows, .. }) = self.cursor_in_table_node() {
+            let n_cols = header
+                .len()
+                .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+            let widths: Vec<usize> = (0..n_cols)
+                .map(|i| {
+                    let hdr_w = header
+                        .get(i)
+                        .map(|rt| {
+                            let s: String = rt.segments().iter().map(|seg| seg.to_string()).collect();
+                            s.width().max(1)
+                        })
+                        .unwrap_or(1);
+                    let body_w = rows
+                        .iter()
+                        .map(|row| {
+                            row.get(i)
+                                .map(|rt| {
+                                    let s: String =
+                                        rt.segments().iter().map(|seg| seg.to_string()).collect();
+                                    s.width().max(1)
+                                })
+                                .unwrap_or(1)
+                        })
+                        .max()
+                        .unwrap_or(1);
+                    hdr_w.max(body_w)
+                })
+                .collect();
+            Some(widths)
+        } else {
+            None
+        }
     }
 }
 
