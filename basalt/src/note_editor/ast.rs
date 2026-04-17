@@ -1,4 +1,4 @@
-use crate::note_editor::rich_text::RichText;
+use crate::note_editor::rich_text::{InlineNode, LinkTarget, RichText};
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum HeadingLevel {
@@ -226,6 +226,11 @@ pub enum Node {
         rows: Vec<Vec<RichText>>,
         source_range: SourceRange<usize>,
     },
+    /// Collected footnote definitions at the end of the document.
+    FootnoteSection {
+        defs: indexmap::IndexMap<String, RichText>,
+        source_range: SourceRange<usize>,
+    },
 }
 
 impl Node {
@@ -238,7 +243,8 @@ impl Node {
             | Self::BlockQuote { source_range, .. }
             | Self::Item { source_range, .. }
             | Self::Task { source_range, .. }
-            | Self::Table { source_range, .. } => source_range,
+            | Self::Table { source_range, .. }
+            | Self::FootnoteSection { source_range, .. } => source_range,
         }
     }
 
@@ -251,7 +257,8 @@ impl Node {
             | Self::BlockQuote { source_range, .. }
             | Self::Item { source_range, .. }
             | Self::Task { source_range, .. }
-            | Self::Table { source_range, .. } => *source_range = new_range,
+            | Self::Table { source_range, .. }
+            | Self::FootnoteSection { source_range, .. } => *source_range = new_range,
         }
     }
 
@@ -386,22 +393,66 @@ pub fn node_to_sexp(node: &Node, indent_level: usize) -> String {
                 indent = indent_level
             )
         }
+        Node::FootnoteSection { defs, source_range } => {
+            let entries: Vec<String> = defs
+                .iter()
+                .map(|(label, rt)| {
+                    format!(
+                        "{:indent$}(footnote \"{}\" {})",
+                        "",
+                        label,
+                        rich_text_to_sexp(rt, indent_level + indent_increment + 2),
+                        indent = indent_level + indent_increment
+                    )
+                })
+                .collect();
+            format!(
+                "{:indent$}(footnote-section @{:?}\n{})",
+                "",
+                source_range,
+                entries.join("\n"),
+                indent = indent_level
+            )
+        }
     }
 }
 
 pub fn rich_text_to_sexp(rich_text: &RichText, indent_level: usize) -> String {
     rich_text
-        .segments()
+        .nodes()
         .iter()
-        .map(|segment| match &segment.style {
-            Some(style) => format!(
-                "{:indent$}({} \"{}\")",
-                "",
-                style,
-                segment,
-                indent = indent_level
-            ),
-            None => format!("{:indent$}\"{}\"", "", segment, indent = indent_level),
+        .map(|node| match node {
+            InlineNode::Text(segment) => match &segment.style {
+                Some(style) => format!(
+                    "{:indent$}({} \"{}\")",
+                    "",
+                    style,
+                    segment,
+                    indent = indent_level
+                ),
+                None => format!("{:indent$}\"{}\"", "", segment, indent = indent_level),
+            },
+            InlineNode::Link { text, target } => {
+                let target_str = match target {
+                    LinkTarget::External(url) => format!("url={}", url),
+                    LinkTarget::FootnoteRef(label) => format!("fnref={}", label),
+                };
+                format!(
+                    "{:indent$}(link \"{}\" {})",
+                    "",
+                    text,
+                    target_str,
+                    indent = indent_level
+                )
+            }
+            InlineNode::FootnoteRef(label) => {
+                format!(
+                    "{:indent$}(footnote-ref \"{}\")",
+                    "",
+                    label,
+                    indent = indent_level
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")

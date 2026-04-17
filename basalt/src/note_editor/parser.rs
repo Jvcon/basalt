@@ -1,10 +1,12 @@
 use std::ops::{Deref, DerefMut};
 
+use indexmap::IndexMap;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Tag, TagEnd};
 
 use crate::note_editor::{
     ast::{self, Node, SourceRange, TaskKind},
-    rich_text::{RichText, Style, TextSegment},
+    rich_text::{RichText, Style, TextSegment, InlineNode},
 };
 
 pub struct Parser<'a>(pulldown_cmark::TextMergeWithOffset<'a, pulldown_cmark::OffsetIter<'a>>);
@@ -64,11 +66,12 @@ impl<'a> Parser<'a> {
     pub fn parse(mut self) -> Vec<Node> {
         let mut result = Vec::new();
         let mut state = ParserState::default();
+        let mut footnote_defs: IndexMap<String, RichText> = IndexMap::new();
 
-        while let Some((event, _)) = self.next() {
+        while let Some((event, _range)) = self.next() {
             match event {
                 Event::Start(tag) if Self::is_container_tag(&tag) => {
-                    if let Some(node) = self.parse_container(tag, &mut state) {
+                    if let Some(node) = self.parse_container(tag, &mut state, &mut footnote_defs) {
                         result.push(node);
                     }
                 }
@@ -76,13 +79,31 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Append FootnoteSection at document end if any definitions were collected
+        if !footnote_defs.is_empty() {
+            let last_range = result
+                .last()
+                .map(|n| n.source_range().clone())
+                .unwrap_or(0..0);
+            result.push(Node::FootnoteSection {
+                defs: footnote_defs,
+                source_range: last_range.end..last_range.end,
+            });
+        }
+
         result
     }
 
-    pub fn parse_container(&mut self, tag: Tag, state: &mut ParserState) -> Option<Node> {
+    pub fn parse_container(
+        &mut self,
+        tag: Tag,
+        state: &mut ParserState,
+        footnote_defs: &mut IndexMap<String, RichText>,
+    ) -> Option<Node> {
         let mut nodes = Vec::new();
-        let mut text_segments = Vec::new();
+        let mut text_segments: Vec<InlineNode> = Vec::new();
         let mut inline_styles = Vec::new();
+        let mut link_accumulator: Option<(String, Vec<String>)> = None; // http/https links only
 
         // Table parsing: dedicated accumulation loop that processes all table events
         // and returns immediately, bypassing the generic event loop below.
@@ -180,6 +201,55 @@ impl<'a> Parser<'a> {
             });
         }
 
+        // FootnoteDefinition: dedicated accumulation loop similar to tables
+        if let Tag::FootnoteDefinition(ref label) = tag {
+            let label = label.to_string();
+            let mut def_segments: Vec<InlineNode> = Vec::new();
+            let mut def_styles: Vec<Style> = Vec::new();
+
+            for (event, _range) in self.by_ref() {
+                match event {
+                    Event::Text(text) => {
+                        let mut seg = TextSegment::plain(&text);
+                        def_styles.iter().for_each(|s| seg.add_style(s));
+                        def_segments.push(InlineNode::Text(seg));
+                    }
+                    Event::Code(text) => {
+                        def_segments.push(InlineNode::Text(TextSegment::styled(&text, Style::Code)));
+                    }
+                    Event::SoftBreak => {
+                        def_segments.push(InlineNode::Text(TextSegment::empty_line()));
+                    }
+                    Event::Start(Tag::Emphasis) => def_styles.push(Style::Emphasis),
+                    Event::Start(Tag::Strong) => def_styles.push(Style::Strong),
+                    Event::Start(Tag::Strikethrough) => def_styles.push(Style::Strikethrough),
+                    Event::End(TagEnd::Emphasis) => {
+                        def_styles.retain(|s| !matches!(s, Style::Emphasis));
+                    }
+                    Event::End(TagEnd::Strong) => {
+                        def_styles.retain(|s| !matches!(s, Style::Strong));
+                    }
+                    Event::End(TagEnd::Strikethrough) => {
+                        def_styles.retain(|s| !matches!(s, Style::Strikethrough));
+                    }
+                    // Skip inner paragraph wrappers — definition content is inline
+                    Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {}
+                    Event::End(TagEnd::FootnoteDefinition) => break,
+                    _ => {}
+                }
+            }
+
+            let def_text = if def_segments.is_empty() {
+                RichText::empty()
+            } else {
+                RichText::from(def_segments)
+            };
+            footnote_defs.insert(label, def_text);
+
+            // FootnoteDefinition does NOT produce a top-level Node
+            return None;
+        }
+
         match tag {
             Tag::List(Some(start)) => {
                 state.item_kind.push(ast::ItemKind::Ordered(start));
@@ -193,14 +263,28 @@ impl<'a> Parser<'a> {
         while let Some((event, source_range)) = self.next() {
             match event {
                 Event::Start(inner_tag) if Self::is_container_tag(&inner_tag) => {
-                    if let Some(node) = self.parse_container(inner_tag, state) {
+                    if let Some(node) = self.parse_container(inner_tag, state, footnote_defs) {
                         nodes.push(node);
                     }
                 }
 
                 Event::Start(inner_tag) if Self::is_inline_tag(&inner_tag) => {
-                    if let Some(style) = Self::tag_to_style(&inner_tag) {
+                    if link_accumulator.is_some() {
+                        // Inside link: ignore inline styling tags for AST simplification
+                        // Link text is rendered as plain, styled via rich_text_to_spans
+                    } else if let Some(style) = Self::tag_to_style(&inner_tag) {
                         inline_styles.push(style);
+                    }
+                }
+
+                Event::End(TagEnd::Emphasis) | Event::End(TagEnd::Strong) | Event::End(TagEnd::Strikethrough) => {
+                    if link_accumulator.is_some() {
+                        // Inside link: ignore end tags
+                    } else {
+                        inline_styles.retain(|s| !matches!(
+                            s,
+                            Style::Emphasis | Style::Strong | Style::Strikethrough
+                        ));
                     }
                 }
 
@@ -213,42 +297,80 @@ impl<'a> Parser<'a> {
                 }
 
                 Event::Code(text) => {
-                    let text_segment = TextSegment::styled(&text, Style::Code);
-                    text_segments.push(text_segment);
+                    // If inside a link accumulator, collect code text for the link
+                    if let Some((_, ref mut text_pieces)) = link_accumulator {
+                        text_pieces.push(text.to_string());
+                    } else {
+                        let text_segment = TextSegment::styled(&text, Style::Code);
+                        text_segments.push(InlineNode::Text(text_segment));
+                    }
+                }
+
+                Event::FootnoteReference(label) => {
+                    // Inline footnote reference marker (e.g. [^1] -> FootnoteRef("1"))
+                    text_segments.push(InlineNode::FootnoteRef(label.to_string()));
+                }
+
+                Event::Start(Tag::Link { dest_url, .. }) => {
+                    // Only accumulate http/https links — other schemes render as plain text
+                    if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
+                        link_accumulator = Some((dest_url.to_string(), Vec::new()));
+                    }
+                }
+
+                Event::End(TagEnd::Link) => {
+                    if let Some((url, text_pieces)) = link_accumulator.take() {
+                        let combined_text = text_pieces.join("");
+                        use crate::note_editor::rich_text::LinkTarget;
+                        text_segments.push(InlineNode::Link {
+                            text: combined_text,
+                            target: LinkTarget::External(url),
+                        });
+                    }
                 }
 
                 Event::Text(text) => {
-                    // ITS Theme task marker detection: only on the very first text segment
-                    // of a Tag::Item that has not already received a TaskListMarker event (D-05, D-06).
-                    let detected = if matches!(tag, Tag::Item)
-                        && state.task_kind.is_empty()
-                        && text_segments.is_empty()
-                    {
-                        extract_its_marker(&text)
+                    // If inside a link accumulator, collect text for the link
+                    if let Some((_, ref mut text_pieces)) = link_accumulator {
+                        text_pieces.push(text.to_string());
                     } else {
-                        None
-                    };
+                        // ITS Theme task marker detection: only on the very first text segment
+                        // of a Tag::Item that has not already received a TaskListMarker event (D-05, D-06).
+                        let detected = if matches!(tag, Tag::Item)
+                            && state.task_kind.is_empty()
+                            && text_segments.is_empty()
+                        {
+                            extract_its_marker(&text)
+                        } else {
+                            None
+                        };
 
-                    if let Some((kind, remaining)) = detected {
-                        state.task_kind.push(kind);
-                        // Only add a text segment for the content after the marker (D-08)
-                        if !remaining.is_empty() {
-                            let mut seg = TextSegment::plain(remaining);
-                            inline_styles.iter().for_each(|s| seg.add_style(s));
-                            text_segments.push(seg);
+                        if let Some((kind, remaining)) = detected {
+                            state.task_kind.push(kind);
+                            // Only add a text segment for the content after the marker (D-08)
+                            if !remaining.is_empty() {
+                                let mut seg = TextSegment::plain(remaining);
+                                inline_styles.iter().for_each(|s| seg.add_style(s));
+                                text_segments.push(InlineNode::Text(seg));
+                            }
+                        } else {
+                            let mut text_segment = TextSegment::plain(&text);
+                            inline_styles.iter().for_each(|style| {
+                                text_segment.add_style(style);
+                            });
+                            text_segments.push(InlineNode::Text(text_segment));
                         }
-                    } else {
-                        let mut text_segment = TextSegment::plain(&text);
-                        inline_styles.iter().for_each(|style| {
-                            text_segment.add_style(style);
-                        });
-                        text_segments.push(text_segment);
                     }
                 }
 
                 Event::SoftBreak => {
-                    let text_segment = TextSegment::empty_line();
-                    text_segments.push(text_segment);
+                    // If inside a link accumulator, collect softbreak as space for the link
+                    if let Some((_, ref mut text_pieces)) = link_accumulator {
+                        text_pieces.push(" ".to_string());
+                    } else {
+                        let text_segment = TextSegment::empty_line();
+                        text_segments.push(InlineNode::Text(text_segment));
+                    }
                 }
 
                 Event::End(tag_end) if Self::tags_match(&tag, &tag_end) => {
@@ -405,6 +527,7 @@ impl<'a> Parser<'a> {
                 | Tag::CodeBlock(..)
                 | Tag::Heading { .. }
                 | Tag::Table(..)
+                | Tag::FootnoteDefinition(..)
         )
     }
 
@@ -422,6 +545,7 @@ impl<'a> Parser<'a> {
                 Tag::CodeBlock(..) => Some(TagEnd::CodeBlock),
                 Tag::Paragraph => Some(TagEnd::Paragraph),
                 Tag::Table(..) => Some(TagEnd::Table),
+                Tag::FootnoteDefinition(..) => Some(TagEnd::FootnoteDefinition),
                 _ => None,
             }
         }
@@ -953,6 +1077,82 @@ mod tests {
             if let Node::Task { kind, .. } = &items[1] {
                 assert_eq!(*kind, ast::TaskKind::Unchecked);
             }
+        }
+    }
+
+    // === Phase 7 Footnote tests (Wave 2 — 07-02 implementation) ===
+
+    #[test]
+    fn test_parse_footnote_reference() {
+        let nodes = Parser::new("Hello [^1] world").parse();
+        let sexp = ast::nodes_to_sexp(&nodes, 0);
+        assert_snapshot!(sexp);
+    }
+
+    #[test]
+    fn test_parse_footnote_section() {
+        let input = indoc! { r#"
+        Text with a reference [^1] here.
+
+        [^1]: This is the footnote definition.
+        "#};
+        let nodes = Parser::new(input).parse();
+        let sexp = ast::nodes_to_sexp(&nodes, 0);
+        assert_snapshot!(sexp);
+    }
+
+    #[test]
+    fn test_parse_multiple_footnotes() {
+        let input = indoc! { r#"
+        First [^1] and second [^2].
+
+        [^1]: First definition.
+        [^2]: Second definition.
+        "#};
+        let nodes = Parser::new(input).parse();
+        let sexp = ast::nodes_to_sexp(&nodes, 0);
+        assert_snapshot!(sexp);
+    }
+
+    // === Phase 7 External link tests (Wave 3 — 07-03 implementation) ===
+
+    #[test]
+    fn test_parse_link() {
+        use crate::note_editor::rich_text::LinkTarget;
+
+        let nodes = Parser::new("Click [here](https://example.com) now").parse();
+        let sexp = ast::nodes_to_sexp(&nodes, 0);
+        assert_snapshot!(sexp);
+        // Verify the link node structure directly
+        assert_eq!(nodes.len(), 1);
+        if let Node::Paragraph { text, .. } = &nodes[0] {
+            let nodes = text.nodes();
+            assert_eq!(nodes.len(), 3);
+            // Check first and third are regular text
+            assert!(matches!(nodes[0], InlineNode::Text(..)));
+            assert!(matches!(nodes[2], InlineNode::Text(..)));
+            // Check middle is a link with correct text and target
+            if let InlineNode::Link { text, target } = &nodes[1] {
+                assert_eq!(text, "here");
+                assert_eq!(target, &LinkTarget::External("https://example.com".to_string()));
+            } else {
+                panic!("Expected InlineNode::Link");
+            }
+        } else {
+            panic!("Expected Paragraph node");
+        }
+    }
+
+    #[test]
+    fn test_parse_non_http_link() {
+        let nodes = Parser::new("Mail [me](mailto:a@b.com)").parse();
+        let sexp = ast::nodes_to_sexp(&nodes, 0);
+        assert_snapshot!(sexp);
+        // Verify mailto links render as plain text, not InlineNode::Link
+        if let Node::Paragraph { text, .. } = &nodes[0] {
+            assert!(text.nodes().iter().all(|n| !matches!(n, InlineNode::Link { .. })));
+        } else {
+            panic!("Expected Paragraph node");
         }
     }
 }

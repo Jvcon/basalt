@@ -3,7 +3,7 @@ mod cursor;
 pub mod editor;
 pub mod parser;
 mod render;
-mod rich_text;
+pub mod rich_text;
 pub mod state;
 mod text_buffer;
 mod text_wrap;

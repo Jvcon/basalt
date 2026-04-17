@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::Span,
@@ -10,7 +11,7 @@ use crate::{
     config::Symbols,
     note_editor::{
         ast::{self, SourceRange},
-        rich_text::RichText,
+        rich_text::{InlineNode, RichText},
         text_wrap::wrap_preserve_trailing,
         virtual_document::{
             content_span, empty_virtual_line, synthetic_span, virtual_line, VirtualBlock,
@@ -85,35 +86,60 @@ fn table_borders(
 }
 
 fn rich_text_display_width(rt: &RichText) -> usize {
-    let s: String = rt.segments().iter().map(|seg| seg.to_string()).collect();
+    let s: String = rt
+        .nodes()
+        .iter()
+        .map(|node| match node {
+            InlineNode::Text(seg) => seg.to_string(),
+            InlineNode::Link { text, .. } => text.clone(),
+            InlineNode::FootnoteRef(label) => format!("[{}]", label),
+        })
+        .collect();
     s.width().max(1) // minimum width 1 so empty cells have a column
 }
 
 /// Convert a [`RichText`] into styled [`Span`]s, applying appropriate ratatui styles.
-#[allow(dead_code)]
 fn rich_text_to_spans<'a>(rt: &RichText) -> Vec<Span<'a>> {
-    rt.segments()
+    rt.nodes()
         .iter()
-        .map(|seg| {
-            let style = match &seg.style {
-                Some(crate::note_editor::rich_text::Style::Strong) => {
-                    Style::default().add_modifier(Modifier::BOLD)
-                }
-                Some(crate::note_editor::rich_text::Style::Emphasis) => {
-                    Style::default().add_modifier(Modifier::ITALIC)
-                }
-                Some(crate::note_editor::rich_text::Style::Strikethrough) => {
-                    Style::default().add_modifier(Modifier::CROSSED_OUT)
-                }
-                Some(crate::note_editor::rich_text::Style::Code) => {
-                    Style::default().fg(Color::Yellow)
-                }
-                Some(crate::note_editor::rich_text::Style::InlineMath) => {
-                    Style::default().fg(Color::Cyan)
-                }
-                None => Style::default(),
-            };
-            Span::styled(seg.content.clone(), style)
+        .map(|node| match node {
+            InlineNode::Text(seg) => {
+                let style = match &seg.style {
+                    Some(crate::note_editor::rich_text::Style::Strong) => {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    }
+                    Some(crate::note_editor::rich_text::Style::Emphasis) => {
+                        Style::default().add_modifier(Modifier::ITALIC)
+                    }
+                    Some(crate::note_editor::rich_text::Style::Strikethrough) => {
+                        Style::default().add_modifier(Modifier::CROSSED_OUT)
+                    }
+                    Some(crate::note_editor::rich_text::Style::Code) => {
+                        Style::default().fg(Color::Yellow)
+                    }
+                    Some(crate::note_editor::rich_text::Style::InlineMath) => {
+                        Style::default().fg(Color::Cyan)
+                    }
+                    None => Style::default(),
+                };
+                Span::styled(seg.content.clone(), style)
+            }
+            InlineNode::Link { text, .. } => {
+                // LINK-01: underline + distinct color for hyperlinks
+                Span::styled(
+                    text.clone(),
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                )
+            }
+            InlineNode::FootnoteRef(label) => {
+                // FOOT-01: [N] in distinct color for footnote references
+                Span::styled(
+                    format!("[{}]", label),
+                    Style::default().fg(Color::LightCyan),
+                )
+            }
         })
         .collect()
 }
@@ -261,7 +287,7 @@ pub fn table<'a>(
         for (i, cell) in cells.iter().enumerate() {
             let align = alignments.get(i).copied().unwrap_or(ast::Alignment::None);
             let cell_w = col_widths.get(i).copied().unwrap_or(1);
-            let cell_str: String = cell.segments().iter().map(|s| s.to_string()).collect();
+            let cell_str: String = cell.to_string();
             let display_w = cell_str.width();
             let pad = cell_w.saturating_sub(display_w);
             let (left_pad, right_pad) = match align {
@@ -1098,7 +1124,44 @@ pub fn render_node<'a>(
             symbols,
             table_h_scroll,
         ),
+        FootnoteSection { defs, source_range } => {
+            render_footnote_section(defs, source_range, max_width, symbols)
+        }
     }
+}
+
+/// Renders footnote definitions section with a separator line and [N]: definition entries.
+fn render_footnote_section<'a>(
+    defs: &IndexMap<String, RichText>,
+    source_range: &SourceRange<usize>,
+    max_width: usize,
+    symbols: &Symbols,
+) -> VirtualBlock<'a> {
+    let mut lines: Vec<VirtualLine> = Vec::new();
+
+    // Separator line — reuse horizontal_rule char from symbols
+    let rule_char = &symbols.horizontal_rule;
+    let rule_str = rule_char.repeat(max_width);
+    lines.push(virtual_line!([synthetic_span!(Span::styled(
+        rule_str,
+        Style::default().fg(Color::DarkGray)
+    ))]));
+
+    // One line per footnote definition
+    for (label, content) in defs {
+        let prefix = format!("[{}]: ", label);
+        let prefix_span = Span::styled(prefix, Style::default().fg(Color::DarkGray));
+        let content_spans = rich_text_to_spans(content);
+
+        let mut spans = vec![synthetic_span!(prefix_span)];
+        spans.extend(content_spans.into_iter().map(|s| synthetic_span!(s)));
+        lines.push(virtual_line!(spans));
+    }
+
+    // Empty line after section
+    lines.push(empty_virtual_line!());
+
+    VirtualBlock::new(&lines, source_range)
 }
 
 // Callout icon/color table - per-type styling
@@ -1250,6 +1313,7 @@ mod tests {
     use super::*;
     use crate::config::{Preset, Symbols};
     use crate::note_editor::rich_text::TextSegment;
+    use insta::assert_snapshot;
 
     // Helper to convert VirtualBlock lines to snapshot-friendly string
     fn virtual_block_to_string(block: &VirtualBlock) -> String {
@@ -1631,6 +1695,80 @@ mod tests {
             );
         } else {
             panic!("expected Table node");
+        }
+    }
+
+    // === Phase 7 Footnote tests (Wave 2 — 07-02 implementation) ===
+
+    #[test]
+    fn test_render_footnote_ref() {
+        let rt = RichText::from(vec![InlineNode::FootnoteRef("1".to_string())]);
+        let spans = rich_text_to_spans(&rt);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "[1]");
+        // Verify color is LightCyan
+        assert_eq!(spans[0].style.fg, Some(Color::LightCyan));
+    }
+
+    #[test]
+    fn snapshot_footnote_section() {
+        let symbols = Symbols::unicode();
+        let mut defs = IndexMap::new();
+        defs.insert(
+            "1".to_string(),
+            RichText::from(vec![TextSegment::plain("First footnote content")]),
+        );
+        defs.insert(
+            "2".to_string(),
+            RichText::from(vec![TextSegment::plain("Second footnote content")]),
+        );
+
+        let block = render_footnote_section(&defs, &(100..200), 40, &symbols);
+        let lines: Vec<String> = block.lines.iter().map(|line| {
+            line.virtual_spans().iter().map(|span| {
+                match span {
+                    VirtualSpan::Synthetic(s) | VirtualSpan::Content(s, _) => s.content.to_string(),
+                }
+            }).collect::<String>()
+        }).collect();
+
+        assert_snapshot!(lines.join("\n"));
+    }
+
+    // === Phase 7 External link tests (Wave 3 — 07-03 implementation) ===
+
+    #[test]
+    fn test_render_link_style() {
+        use crate::note_editor::rich_text::{InlineNode, LinkTarget};
+
+        let rt = RichText::from(vec![InlineNode::Link {
+            text: "click here".to_string(),
+            target: LinkTarget::External("https://example.com".to_string()),
+        }]);
+        let spans = rich_text_to_spans(&rt);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "click here");
+        assert_eq!(spans[0].style.fg, Some(Color::LightCyan));
+        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn test_non_http_link_no_osc8() {
+        // Verify that non-http links parsed as plain text do not produce Link nodes
+        use crate::note_editor::{parser, rich_text::InlineNode};
+
+        let nodes = parser::from_str("Mail [me](mailto:a@b.com)");
+        let paragraph = &nodes[0];
+        if let crate::note_editor::ast::Node::Paragraph { text, .. } = paragraph {
+            for node in text.nodes() {
+                // None of the nodes should be InlineNode::Link
+                assert!(
+                    !matches!(node, InlineNode::Link { .. }),
+                    "mailto link should not produce InlineNode::Link"
+                );
+            }
+        } else {
+            panic!("Expected Paragraph node");
         }
     }
 }

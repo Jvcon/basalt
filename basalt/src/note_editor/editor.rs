@@ -63,6 +63,7 @@ impl<'a> StatefulWidget for NoteEditor<'a> {
         // Calling the resize_width will cause the visual blocks to be populated in the state.
         // If width or height is not changed between frames, the resize_width is a noop.
         state.resize_viewport(inner_area.as_size());
+        state.inner_area = inner_area;
 
         state.update_layout();
 

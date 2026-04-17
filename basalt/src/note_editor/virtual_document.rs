@@ -4,6 +4,7 @@ use std::{
 };
 
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::SyntectContext,
@@ -13,6 +14,7 @@ use crate::{
         render::{render_node, text_wrap, RenderStyle},
         state::View,
         text_buffer::TextBuffer,
+        rich_text::LinkMapEntry,
     },
     stylized_text::stylize,
 };
@@ -177,6 +179,7 @@ pub struct VirtualDocument<'a> {
     blocks: Vec<VirtualBlock<'a>>,
     lines: Vec<VirtualLine<'a>>,
     line_to_block: Vec<usize>,
+    link_map: Vec<LinkMapEntry>,
 }
 
 impl<'a> VirtualDocument<'a> {
@@ -201,6 +204,10 @@ impl<'a> VirtualDocument<'a> {
 
     pub fn line_to_block(&self) -> &[usize] {
         &self.line_to_block
+    }
+
+    pub fn link_map(&self) -> &[LinkMapEntry] {
+        &self.link_map
     }
 
     pub fn get_block(&self, block_idx: usize) -> Option<(usize, &VirtualBlock<'_>)> {
@@ -302,5 +309,74 @@ impl<'a> VirtualDocument<'a> {
         self.blocks = blocks;
         self.lines = lines;
         self.line_to_block = line_to_block;
+
+        // Populate link_map for OSC 8 hyperlink emission
+        self.link_map.clear();
+
+        // Step A: Collect all external links from the AST in document order.
+        let mut all_links: Vec<(String, String)> = Vec::new();
+        fn collect_links(
+            nodes: &[crate::note_editor::ast::Node],
+            links: &mut Vec<(String, String)>,
+        ) {
+            for node in nodes {
+                match node {
+                    crate::note_editor::ast::Node::Paragraph { text, .. }
+                    | crate::note_editor::ast::Node::Heading { text, .. } => {
+                        for inline in text.nodes() {
+                            if let crate::note_editor::rich_text::InlineNode::Link {
+                                text,
+                                target: crate::note_editor::rich_text::LinkTarget::External(
+                                    url,
+                                ),
+                            } = inline
+                            {
+                                links.push((text.clone(), url.clone()));
+                            }
+                        }
+                    }
+                    crate::note_editor::ast::Node::BlockQuote { nodes, .. }
+                    | crate::note_editor::ast::Node::List { nodes, .. }
+                    | crate::note_editor::ast::Node::Item { nodes, .. }
+                    | crate::note_editor::ast::Node::Task { nodes, .. } => {
+                        collect_links(nodes, links);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        collect_links(ast_nodes, &mut all_links);
+
+        // Step B: Walk rendered lines and match link text to display positions.
+        let mut link_iter = all_links.iter();
+        'outer: for (line_idx, line) in self.lines.iter().enumerate() {
+            let mut col = 0usize;
+            for span in line.virtual_spans() {
+                let s = match span {
+                    VirtualSpan::Synthetic(s) | VirtualSpan::Content(s, _) => s,
+                };
+                let content_str = s.content.as_ref();
+                let span_width = UnicodeWidthStr::width(content_str);
+
+                if let Some((link_text, _url)) = link_iter.as_slice().first() {
+                    if content_str == link_text.as_str() {
+                        let (text, url) = link_iter.next().unwrap();
+                        self.link_map.push(crate::note_editor::rich_text::LinkMapEntry {
+                            line_idx,
+                            col_start: col,
+                            col_end: col + span_width,
+                            text: text.clone(),
+                            target: crate::note_editor::rich_text::LinkTarget::External(
+                                url.clone(),
+                            ),
+                        });
+                        if link_iter.as_slice().is_empty() {
+                            break 'outer;
+                        }
+                    }
+                }
+                col += span_width;
+            }
+        }
     }
 }

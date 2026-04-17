@@ -15,7 +15,7 @@ use crate::{
         ast::{self},
         cursor::{self, Cursor},
         parser,
-        rich_text::RichText,
+        rich_text::{RichText, LinkMapEntry},
         text_buffer::TextBuffer,
         viewport::Viewport,
         virtual_document::VirtualDocument,
@@ -73,6 +73,11 @@ pub struct NoteEditorState<'a> {
     /// Horizontal scroll offset (in display-width chars) for the currently active table.
     /// Resets to 0 when the cursor leaves the table's source range (D-13).
     pub table_h_scroll: usize,
+    /// Link map for OSC 8 hyperlink emission — populated during layout.
+    /// Stores screen positions of external links for clickability.
+    pub link_map: Vec<LinkMapEntry>,
+    /// Inner area of the note editor widget — used for OSC 8 position calculation.
+    pub inner_area: ratatui::layout::Rect,
 }
 
 impl<'a> NoteEditorState<'a> {
@@ -103,6 +108,8 @@ impl<'a> NoteEditorState<'a> {
             modified: false,
             editing_block: None,
             table_h_scroll: 0,
+            link_map: Vec::new(),
+            inner_area: ratatui::layout::Rect::default(),
         }
     }
 
@@ -450,6 +457,9 @@ impl<'a> NoteEditorState<'a> {
             self.table_h_scroll,
         );
 
+        // Copy link_map from virtual_document for OSC 8 emission
+        self.link_map = self.virtual_document.link_map().to_vec();
+
         self.cursor.update(
             Jump(self.cursor.source_offset()),
             self.virtual_document.lines(),
@@ -602,7 +612,7 @@ impl<'a> NoteEditorState<'a> {
                     let hdr_w = header
                         .get(i)
                         .map(|rt| {
-                            let s: String = rt.segments().iter().map(|seg| seg.to_string()).collect();
+                            let s: String = rt.to_string();
                             s.width().max(1)
                         })
                         .unwrap_or(1);
@@ -611,8 +621,7 @@ impl<'a> NoteEditorState<'a> {
                         .map(|row| {
                             row.get(i)
                                 .map(|rt| {
-                                    let s: String =
-                                        rt.segments().iter().map(|seg| seg.to_string()).collect();
+                                    let s: String = rt.to_string();
                                     s.width().max(1)
                                 })
                                 .unwrap_or(1)
