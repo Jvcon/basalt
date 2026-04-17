@@ -123,23 +123,20 @@ impl<'a> Parser<'a> {
                 alignments_raw.iter().copied().map(ast::Alignment::from).collect();
             let mut header: Vec<RichText> = Vec::new();
             let mut rows: Vec<Vec<RichText>> = Vec::new();
-            let mut in_header = false;
             // current_cells accumulates cells in header (during TableHead) or in a body row
             let mut current_cells: Vec<RichText> = Vec::new();
             let mut cell_segments: Vec<TextSegment> = Vec::new();
             let mut cell_styles: Vec<Style> = Vec::new();
             let mut source_range = 0..0;
 
-            while let Some((event, range)) = self.next() {
+            for (event, range) in self.by_ref() {
                 match event {
                     Event::Start(Tag::TableHead) => {
-                        in_header = true;
                         current_cells = Vec::new();
                     }
                     Event::End(TagEnd::TableHead) => {
                         // Header cells are collected directly (no TableRow wrapper in TableHead)
                         header = std::mem::take(&mut current_cells);
-                        in_header = false;
                     }
                     Event::Start(Tag::TableRow) => {
                         current_cells = Vec::new();
