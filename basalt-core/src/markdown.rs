@@ -65,8 +65,6 @@ pub enum Style {
     Strikethrough,
     /// Bold/strong style (e.g. `**strong**`).
     Strong,
-    /// Inline math style (e.g. `$formula$`).
-    InlineMath,
 }
 
 /// Represents the variant of a list or task item (checked, unchecked, etc.).
@@ -113,15 +111,32 @@ impl From<pulldown_cmark::HeadingLevel> for HeadingLevel {
 /// Represents specialized block quote kind variants (tip, note, warning, etc.).
 ///
 /// Currently, the underlying [`pulldown_cmark`] parser distinguishes these via syntax like `">
-/// [!NOTE] Some note"`.
+/// [!NOTE] Some note"`. ITS Theme extended callout types are detected via post-processing.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub enum BlockQuoteKind {
+    // Standard GitHub Alert (pulldown-cmark native)
     Note,
     Tip,
     Important,
     Warning,
     Caution,
+    // ITS Theme Extended (post-processing detection)
+    Aside,
+    Blank,
+    Caption,
+    Cards,
+    Checks,
+    Column,
+    Grid,
+    Infobox,
+    Kanban,
+    Kith,
+    Metadata,
+    Quote,
+    Recite,
+    Statblocks,
+    Timeline,
 }
 
 impl From<pulldown_cmark::BlockQuoteKind> for BlockQuoteKind {
@@ -301,8 +316,6 @@ impl Node {
                     last_node.push_text_node(node);
                 }
             }
-            // Rule and DisplayMath store no inline text — no-op.
-            MarkdownNode::Rule | MarkdownNode::DisplayMath { .. } => {}
         }
     }
 }
@@ -328,6 +341,7 @@ pub enum MarkdownNode {
     /// `"> Block quote"`.
     BlockQuote {
         kind: Option<BlockQuoteKind>,
+        title: Option<String>,
         nodes: Vec<Node>,
     },
     /// A fenced code block, optionally with a language identifier.
@@ -342,12 +356,6 @@ pub enum MarkdownNode {
     Item {
         kind: Option<ItemKind>,
         text: Text,
-    },
-    /// A horizontal rule (thematic break) rendered as a separator line.
-    Rule,
-    /// A display math block (e.g. `$$...$$`), storing the formula content.
-    DisplayMath {
-        content: String,
     },
 }
 
@@ -393,6 +401,37 @@ fn matches_tag_end(node: &Node, tag_end: &TagEnd) -> bool {
 /// ```
 pub fn from_str(text: &str) -> Vec<Node> {
     Parser::new(text).parse()
+}
+
+/// Maps an ITS Theme callout type string (case-insensitive) to a [`BlockQuoteKind`] variant.
+/// Returns [`None`] for unrecognized type strings (treated as plain blockquotes).
+/// Handles aliases: caption/captions, column/columns, quote/quotes.
+fn its_theme_kind(type_str: &str) -> Option<BlockQuoteKind> {
+    match type_str.to_ascii_lowercase().as_str() {
+        // Standard GitHub Alert types (for case-insensitive support)
+        "note" => Some(BlockQuoteKind::Note),
+        "tip" => Some(BlockQuoteKind::Tip),
+        "important" => Some(BlockQuoteKind::Important),
+        "warning" => Some(BlockQuoteKind::Warning),
+        "caution" => Some(BlockQuoteKind::Caution),
+        // ITS Theme Extended (post-processing detection)
+        "aside" => Some(BlockQuoteKind::Aside),
+        "blank" => Some(BlockQuoteKind::Blank),
+        "caption" | "captions" => Some(BlockQuoteKind::Caption),
+        "cards" => Some(BlockQuoteKind::Cards),
+        "checks" => Some(BlockQuoteKind::Checks),
+        "column" | "columns" => Some(BlockQuoteKind::Column),
+        "grid" => Some(BlockQuoteKind::Grid),
+        "infobox" => Some(BlockQuoteKind::Infobox),
+        "kanban" => Some(BlockQuoteKind::Kanban),
+        "kith" => Some(BlockQuoteKind::Kith),
+        "metadata" => Some(BlockQuoteKind::Metadata),
+        "quote" | "quotes" => Some(BlockQuoteKind::Quote),
+        "recite" => Some(BlockQuoteKind::Recite),
+        "statblocks" => Some(BlockQuoteKind::Statblocks),
+        "timeline" => Some(BlockQuoteKind::Timeline),
+        _ => None,
+    }
 }
 
 /// A parser that consumes [`pulldown_cmark::Event`]s and produces a [`Vec`] of [`Node`].
@@ -500,24 +539,18 @@ impl<'a> Parser<'a> {
             Tag::BlockQuote(kind) => self.push_node(Node::new(
                 MarkdownNode::BlockQuote {
                     kind: kind.map(|kind| kind.into()),
+                    title: None,
                     nodes: vec![],
                 },
                 range,
             )),
-            Tag::CodeBlock(kind) => {
-                use pulldown_cmark::CodeBlockKind;
-                let lang = match kind {
-                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => Some(lang.to_string()),
-                    _ => None,
-                };
-                self.push_node(Node::new(
-                    MarkdownNode::CodeBlock {
-                        lang,
-                        text: Text::default(),
-                    },
-                    range,
-                ))
-            }
+            Tag::CodeBlock(_) => self.push_node(Node::new(
+                MarkdownNode::CodeBlock {
+                    lang: None,
+                    text: Text::default(),
+                },
+                range,
+            )),
             Tag::Item => self.push_node(Node::new(
                 MarkdownNode::Item {
                     kind: None,
@@ -549,9 +582,74 @@ impl<'a> Parser<'a> {
 
     /// Handles the end of a [`Tag`], finalizing a node if matching.
     fn tag_end(&mut self, tag_end: TagEnd) {
-        let Some(node) = self.current_node.take() else {
+        let Some(mut node) = self.current_node.take() else {
             return;
         };
+
+        // ITS Theme post-processing for BlockQuote nodes.
+        //
+        // pulldown-cmark does not natively recognize ITS Theme callout types (e.g. `[!aside]`).
+        // They appear as regular blockquotes with `kind == None`. The `[!type]` marker and any
+        // following body text may appear in the same tight paragraph (connected by SoftBreak,
+        // which we emit as `\n`). We detect the pattern by:
+        //   1. Taking only the first line of the first child paragraph text.
+        //   2. Matching `[!type]` and optional title text on that first line.
+        //   3. If the paragraph had body content after the `\n`, re-inserting it as a new
+        //      Paragraph node at position 0 of nodes so it renders as body content.
+        if let (
+            MarkdownNode::BlockQuote {
+                ref mut kind,
+                ref mut title,
+                ref mut nodes,
+            },
+            TagEnd::BlockQuote(_),
+        ) = (&mut node.markdown_node, &tag_end)
+        {
+            if kind.is_none() {
+                if let Some(first_node) = nodes.first() {
+                    if let MarkdownNode::Paragraph { text } = &first_node.markdown_node {
+                        let first_text: String =
+                            text.clone().into_iter().map(|n| n.content).collect();
+                        // Only examine the first line (before any SoftBreak newline).
+                        let (first_line, remainder) =
+                            match first_text.split_once('\n') {
+                                Some((first, rest)) => (first.trim(), rest.trim()),
+                                None => (first_text.trim(), ""),
+                            };
+                        if let Some(rest) = first_line.strip_prefix("[!") {
+                            if let Some(bracket_end) = rest.find(']') {
+                                let type_str = &rest[..bracket_end];
+                                let after_bracket = rest[bracket_end + 1..].trim().to_string();
+                                if let Some(detected_kind) = its_theme_kind(type_str) {
+                                    *kind = Some(detected_kind);
+                                    *title = if after_bracket.is_empty() {
+                                        None
+                                    } else {
+                                        Some(after_bracket)
+                                    };
+                                    // Determine the source range of the first node before removing it.
+                                    let first_range = first_node.source_range.clone();
+                                    nodes.remove(0);
+                                    // If there was body content after the [!type] line in the same
+                                    // paragraph (due to SoftBreak merging), re-insert it as body.
+                                    if !remainder.is_empty() {
+                                        nodes.insert(
+                                            0,
+                                            Node::new(
+                                                MarkdownNode::Paragraph {
+                                                    text: Text::from(remainder),
+                                                },
+                                                first_range,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         if matches_tag_end(&node, &tag_end) {
             self.output.push(node);
@@ -591,38 +689,18 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
-            Event::Rule => {
-                // Finalize any in-progress node before pushing Rule.
-                if let Some(node) = self.current_node.take() {
-                    self.output.push(node);
-                }
-                self.output.push(Node::new(MarkdownNode::Rule, range));
+            Event::SoftBreak => {
+                // Insert a newline separator so that ITS Theme callout detection can
+                // distinguish the [!type] line from subsequent body content within the
+                // same tight paragraph (e.g. `> [!aside]\n> body text`).
+                self.push_text_node(TextNode::new("\n".to_string(), None));
             }
-            Event::InlineMath(text) => {
-                self.push_text_node(TextNode::new(text.to_string(), Some(Style::InlineMath)))
-            }
-            Event::DisplayMath(content) => {
-                // Finalize any in-progress node before pushing DisplayMath.
-                // pulldown-cmark wraps $$...$$ in a Paragraph container; the Paragraph
-                // end tag will be ignored because current_node is cleared here.
-                if let Some(node) = self.current_node.take() {
-                    // Only push the preceding node if it has content (not the empty wrapper).
-                    if !matches!(&node.markdown_node, MarkdownNode::Paragraph { text } if text.0.is_empty())
-                    {
-                        self.output.push(node);
-                    }
-                }
-                self.output.push(Node::new(
-                    MarkdownNode::DisplayMath {
-                        content: content.to_string(),
-                    },
-                    range,
-                ));
-            }
-            Event::Html(_)
+            Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::Html(_)
             | Event::InlineHtml(_)
-            | Event::SoftBreak
             | Event::HardBreak
+            | Event::Rule
             | Event::FootnoteReference(_) => {
                 // TODO: Not yet implemented
             }
@@ -672,7 +750,14 @@ mod tests {
     }
 
     fn blockquote(nodes: Vec<Node>, range: Range<usize>) -> Node {
-        Node::new(MarkdownNode::BlockQuote { kind: None, nodes }, range)
+        Node::new(
+            MarkdownNode::BlockQuote {
+                kind: None,
+                title: None,
+                nodes,
+            },
+            range,
+        )
     }
 
     fn item(str: &str, range: Range<usize>) -> Node {
@@ -739,53 +824,7 @@ mod tests {
         heading(HeadingLevel::H6, str, range)
     }
 
-    fn code_block(lang: Option<&str>, text: &str, range: Range<usize>) -> Node {
-        Node::new(
-            MarkdownNode::CodeBlock {
-                lang: lang.map(|s| s.to_string()),
-                text: text.into(),
-            },
-            range,
-        )
-    }
-
     use super::*;
-
-    #[test]
-    fn test_code_block_lang_extraction() {
-        // Fenced with language
-        let input = indoc! {"
-            ```rust
-            let x = 1;
-            ```
-        "};
-        let nodes = from_str(input);
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0], code_block(Some("rust"), "let x = 1;\n", 0..22));
-
-        // Fenced without language
-        let input2 = indoc! {"
-            ```
-            plain code
-            ```
-        "};
-        let nodes2 = from_str(input2);
-        assert_eq!(nodes2.len(), 1);
-        assert_eq!(nodes2[0], code_block(None, "plain code\n", 0..18));
-
-        // Fenced with python
-        let input3 = indoc! {"
-            ```python
-            print('hi')
-            ```
-        "};
-        let nodes3 = from_str(input3);
-        assert_eq!(nodes3.len(), 1);
-        assert_eq!(
-            nodes3[0],
-            code_block(Some("python"), "print('hi')\n", 0..25)
-        );
-    }
 
     #[test]
     fn test_parse() {
@@ -864,51 +903,133 @@ mod tests {
             .for_each(|test| assert_eq!(from_str(test.0), test.1));
     }
 
+    /// Helper: parse a string and return only the kind, title, node-text, and overall source range.
+    /// Source ranges for re-inserted body paragraphs may not precisely reflect the original
+    /// source offset (because SoftBreak-merged content loses sub-range precision), so we
+    /// compare the semantic content rather than byte ranges.
+    fn parse_blockquote_semantics(input: &str) -> (Option<BlockQuoteKind>, Option<String>, Vec<String>, Range<usize>) {
+        let nodes = from_str(input);
+        assert_eq!(nodes.len(), 1, "expected exactly one top-level node");
+        match nodes.into_iter().next().unwrap() {
+            Node { markdown_node: MarkdownNode::BlockQuote { kind, title, nodes }, source_range } => {
+                let body_texts: Vec<String> = nodes.into_iter().filter_map(|n| {
+                    match n.markdown_node {
+                        MarkdownNode::Paragraph { text } => {
+                            Some(text.into_iter().map(|t| t.content).collect::<String>())
+                        }
+                        _ => None,
+                    }
+                }).collect();
+                (kind, title, body_texts, source_range)
+            }
+            _ => panic!("expected BlockQuote node"),
+        }
+    }
+
     #[test]
-    fn test_rule_and_math() {
-        // Horizontal rule produces a single Rule node.
-        let rule_nodes = from_str("---");
-        assert_eq!(rule_nodes.len(), 1);
-        assert_eq!(rule_nodes[0].markdown_node, MarkdownNode::Rule);
+    fn its_theme_aside_callout() {
+        let (kind, title, body, _) = parse_blockquote_semantics("> [!aside]\n> body text");
+        assert_eq!(kind, Some(BlockQuoteKind::Aside));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text".to_string()]);
+    }
 
-        // Inline math produces a Paragraph with an InlineMath-styled TextNode.
-        let inline_math_nodes = from_str("$E = mc^2$");
-        assert_eq!(inline_math_nodes.len(), 1);
-        if let MarkdownNode::Paragraph { text } = &inline_math_nodes[0].markdown_node {
-            let nodes: Vec<_> = text.clone().into_iter().collect();
-            assert_eq!(nodes.len(), 1);
-            assert_eq!(nodes[0].content, "E = mc^2");
-            assert_eq!(nodes[0].style, Some(Style::InlineMath));
-        } else {
-            panic!("Expected Paragraph node for inline math");
-        }
+    #[test]
+    fn its_theme_kanban_with_title() {
+        let (kind, title, body, _) = parse_blockquote_semantics("> [!kanban] My Board\n> body text");
+        assert_eq!(kind, Some(BlockQuoteKind::Kanban));
+        assert_eq!(title, Some("My Board".to_string()));
+        assert_eq!(body, vec!["body text".to_string()]);
+    }
 
-        // Inline math mixed with plain text produces three TextNodes.
-        let mixed_nodes = from_str("Hello $x$ world");
-        assert_eq!(mixed_nodes.len(), 1);
-        if let MarkdownNode::Paragraph { text } = &mixed_nodes[0].markdown_node {
-            let nodes: Vec<_> = text.clone().into_iter().collect();
-            assert_eq!(nodes.len(), 3);
-            assert_eq!(nodes[0].content, "Hello ");
-            assert_eq!(nodes[0].style, None);
-            assert_eq!(nodes[1].content, "x");
-            assert_eq!(nodes[1].style, Some(Style::InlineMath));
-            assert_eq!(nodes[2].content, " world");
-            assert_eq!(nodes[2].style, None);
-        } else {
-            panic!("Expected Paragraph node for mixed inline math");
-        }
+    #[test]
+    fn its_theme_case_insensitive() {
+        let (kind, title, body, _) = parse_blockquote_semantics("> [!ASIDE]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Aside));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body".to_string()]);
+    }
 
-        // Display math produces a single DisplayMath node with the formula content.
-        let display_math_nodes = from_str("$$\n\\int_0^\\infty e^{-x} dx = 1\n$$");
-        assert_eq!(display_math_nodes.len(), 1);
-        if let MarkdownNode::DisplayMath { content } = &display_math_nodes[0].markdown_node {
-            assert!(content.contains("\\int_0^\\infty"));
-        } else {
-            panic!(
-                "Expected DisplayMath node, got {:?}",
-                display_math_nodes[0].markdown_node
-            );
+    #[test]
+    fn its_theme_aliases() {
+        // caption/captions alias
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!captions]\n> text");
+        assert_eq!(kind, Some(BlockQuoteKind::Caption));
+
+        // column/columns alias
+        let (kind2, _, _, _) = parse_blockquote_semantics("> [!columns]\n> text");
+        assert_eq!(kind2, Some(BlockQuoteKind::Column));
+
+        // quote/quotes alias
+        let (kind3, _, _, _) = parse_blockquote_semantics("> [!quotes]\n> text");
+        assert_eq!(kind3, Some(BlockQuoteKind::Quote));
+    }
+
+    #[test]
+    fn plain_blockquote_unchanged() {
+        let input = "> plain text";
+        let nodes = from_str(input);
+        assert_eq!(
+            nodes,
+            vec![blockquote(vec![p("plain text", 2..12)], 0..12)]
+        );
+    }
+
+    #[test]
+    fn unknown_type_stays_plain() {
+        // Unknown [!type] is NOT consumed: remains as plain blockquote with
+        // the [!unknowntype] text merged into body via SoftBreak handling.
+        let input = "> [!unknowntype]\n> body";
+        let nodes = from_str(input);
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0].markdown_node {
+            MarkdownNode::BlockQuote { kind, title, nodes: inner } => {
+                assert_eq!(*kind, None);
+                assert_eq!(*title, None);
+                // The body text depends on SoftBreak handling: one merged paragraph
+                // with "[!unknowntype]\nbody" or separate paragraphs.
+                // We just assert the callout was NOT classified.
+                assert!(!inner.is_empty(), "plain blockquote should have nodes");
+            }
+            _ => panic!("expected BlockQuote"),
         }
+    }
+
+    #[test]
+    fn standard_callout_kind_unchanged() {
+        // Standard GitHub Alert types use pulldown-cmark native detection.
+        // The [!tip] line is consumed by pulldown-cmark itself.
+        let (kind, title, body, _) = parse_blockquote_semantics("> [!tip]\n> body text");
+        assert_eq!(kind, Some(BlockQuoteKind::Tip));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text".to_string()]);
+    }
+
+    #[test]
+    fn standard_callout_case_insensitive() {
+        // Verify ITS Theme detection handles lowercase standard types.
+        let (kind, title, body, _) = parse_blockquote_semantics("> [!note]\n> body text");
+        assert_eq!(kind, Some(BlockQuoteKind::Note));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text".to_string()]);
+    }
+
+    #[test]
+    fn standard_callout_all_types_support() {
+        // Test all 5 standard types with lowercase.
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!note]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Note));
+
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!tip]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Tip));
+
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!important]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Important));
+
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!warning]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Warning));
+
+        let (kind, _, _, _) = parse_blockquote_semantics("> [!caution]\n> body");
+        assert_eq!(kind, Some(BlockQuoteKind::Caution));
     }
 }

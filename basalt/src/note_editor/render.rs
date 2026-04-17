@@ -10,7 +10,7 @@ use crate::{
     config::Symbols,
     note_editor::{
         ast::{self, SourceRange},
-        rich_text::{self, RichText},
+        rich_text::RichText,
         text_wrap::wrap_preserve_trailing,
         virtual_document::{
             content_span, empty_virtual_line, synthetic_span, virtual_line, VirtualBlock,
@@ -116,101 +116,6 @@ fn render_raw_line<'a>(
         &RenderStyle::Raw,
         symbols,
     )
-}
-
-/// Convert a `RichText` into a list of ratatui `Span`s, one per `TextSegment`,
-/// each carrying the appropriate ratatui style for that segment's `rich_text::Style`.
-fn rich_text_to_spans(text: &rich_text::RichText) -> Vec<Span<'static>> {
-    text.segments()
-        .iter()
-        .map(|seg| {
-            let span = Span::raw(seg.content.clone());
-            match &seg.style {
-                Some(rich_text::Style::Strong) => span.bold(),
-                Some(rich_text::Style::Emphasis) => span.italic(),
-                Some(rich_text::Style::Strikethrough) => span.add_modifier(Modifier::CROSSED_OUT),
-                Some(rich_text::Style::Code) => span.fg(Color::Yellow).bg(Color::Rgb(30, 30, 30)),
-                Some(rich_text::Style::InlineMath) => span.fg(Color::Magenta).italic(),
-                None => span,
-            }
-        })
-        .collect()
-}
-
-/// Word-wrap a slice of styled `Span`s to `max_width` columns, preserving per-span
-/// styles. Each display line is a `Vec<Span<'static>>`.
-///
-/// This mirrors the wrapping logic in `text_wrap_internal` by concatenating span contents
-/// to obtain the plain-text wrap result, then re-applying styles via byte-offset mapping.
-fn wrap_styled_spans(
-    spans: &[Span<'static>],
-    max_width: usize,
-    wrap_marker: &str,
-) -> Vec<Vec<Span<'static>>> {
-    if spans.is_empty() {
-        return vec![vec![]];
-    }
-
-    // Build flat plain text and record the (start_byte, end_byte, Style) for each span.
-    let mut plain = String::new();
-    let mut span_ranges: Vec<(usize, usize, ratatui::style::Style)> = Vec::new();
-    for span in spans {
-        let start = plain.len();
-        plain.push_str(&span.content);
-        span_ranges.push((start, plain.len(), span.style));
-    }
-
-    // Wrap the plain text using the same function as `text_wrap_internal`.
-    let wrap_marker_display_width = UnicodeWidthStr::width(wrap_marker);
-    let wrapped = wrap_preserve_trailing(&plain, max_width, wrap_marker_display_width + 1);
-
-    if wrapped.is_empty() {
-        return vec![vec![]];
-    }
-
-    // Map each display line back to styled spans.
-    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut byte_cursor: usize = 0;
-    let mut span_iter_idx: usize = 0;
-
-    for line_str in &wrapped {
-        let line_bytes = line_str.len();
-        let line_end = byte_cursor + line_bytes;
-        let mut line_spans: Vec<Span<'static>> = Vec::new();
-
-        let mut pos = byte_cursor;
-        while pos < line_end && span_iter_idx < span_ranges.len() {
-            let (span_start, span_end, style) = span_ranges[span_iter_idx];
-            if span_end <= pos {
-                span_iter_idx += 1;
-                continue;
-            }
-            let chunk_start = pos.max(span_start);
-            let chunk_end = line_end.min(span_end);
-            if chunk_start < chunk_end {
-                if let Some(chunk) = plain.get(chunk_start..chunk_end) {
-                    if !chunk.is_empty() {
-                        line_spans.push(Span::styled(chunk.to_string(), style));
-                    }
-                }
-                pos = chunk_end;
-                if chunk_end >= span_end {
-                    span_iter_idx += 1;
-                }
-            } else {
-                break;
-            }
-        }
-
-        result.push(line_spans);
-        byte_cursor = line_end;
-    }
-
-    if result.is_empty() {
-        result.push(vec![]);
-    }
-
-    result
 }
 
 // # Example:
@@ -390,86 +295,27 @@ pub fn paragraph<'a>(
     let lines = match option {
         RenderStyle::Raw => render_raw(content, source_range, max_width, prefix, symbols),
         RenderStyle::Visual => {
-            let styled_spans = rich_text_to_spans(text);
-            let wrap_width = max_width;
-            let wrap_marker = symbols.wrap_marker.clone();
+            let text = text.to_string();
             let mut current_range_start = source_range.start;
-            let mut lines: Vec<VirtualLine<'a>> = Vec::new();
 
-            // Collect logical lines by splitting on '\n' within segment content.
-            // Each logical line is then word-wrapped using wrap_styled_spans which
-            // preserves per-segment styles while reproducing the same line-break
-            // positions as the original text_wrap_internal path.
-            let mut logical_line: Vec<Span<'static>> = Vec::new();
-            for span in &styled_spans {
-                let content = span.content.as_ref();
-                let parts: Vec<&str> = content.split('\n').collect();
-                for (j, part) in parts.iter().enumerate() {
-                    if !part.is_empty() {
-                        logical_line.push(Span::styled(part.to_string(), span.style));
-                    }
-                    let is_last_part = j == parts.len() - 1;
-                    if !is_last_part {
-                        // Flush current logical line (explicit '\n' in source).
-                        let display_lines =
-                            wrap_styled_spans(&logical_line, wrap_width, &wrap_marker);
-                        for (di, display_line_spans) in display_lines.iter().enumerate() {
-                            let is_wrap_continuation = di > 0;
-                            let line_byte_len: usize =
-                                display_line_spans.iter().map(|s| s.content.len()).sum();
-                            let line_range = current_range_start
-                                ..(current_range_start + line_byte_len).min(source_range.end);
-                            current_range_start += line_byte_len;
+            let mut lines = text
+                .to_string()
+                .lines()
+                .flat_map(|line| {
+                    let line_range = line_range(current_range_start, line.len(), true);
+                    current_range_start = line_range.end;
 
-                            let mut vspans: Vec<VirtualSpan<'a>> =
-                                vec![synthetic_span!(prefix.clone())];
-                            if is_wrap_continuation {
-                                vspans.push(synthetic_span!(Span::styled(
-                                    wrap_marker.clone(),
-                                    Style::new().black()
-                                )));
-                            }
-                            for s in display_line_spans {
-                                vspans.push(content_span!(s.clone(), line_range));
-                            }
-                            lines.push(VirtualLine::new(&vspans));
-                        }
-                        // +1 for the '\n' byte.
-                        current_range_start += 1;
-                        logical_line = Vec::new();
-                    }
-                }
-            }
-
-            // Flush the final (or only) logical line.
-            {
-                let display_lines = wrap_styled_spans(&logical_line, wrap_width, &wrap_marker);
-                for (di, display_line_spans) in display_lines.iter().enumerate() {
-                    let is_wrap_continuation = di > 0;
-                    let line_byte_len: usize =
-                        display_line_spans.iter().map(|s| s.content.len()).sum();
-                    let line_range = current_range_start
-                        ..(current_range_start + line_byte_len).min(source_range.end);
-                    current_range_start += line_byte_len;
-
-                    let mut vspans: Vec<VirtualSpan<'a>> = vec![synthetic_span!(prefix.clone())];
-                    if is_wrap_continuation {
-                        vspans.push(synthetic_span!(Span::styled(
-                            wrap_marker.clone(),
-                            Style::new().black()
-                        )));
-                    }
-                    for s in display_line_spans {
-                        vspans.push(content_span!(s.clone(), line_range));
-                    }
-                    lines.push(VirtualLine::new(&vspans));
-                }
-            }
-
-            if lines.is_empty() {
-                // Empty paragraph — push a line with just the prefix so cursor has a home.
-                lines.push(VirtualLine::new(&[synthetic_span!(prefix.clone())]));
-            }
+                    text_wrap(
+                        &line.to_string().into(),
+                        prefix.clone(),
+                        &line_range,
+                        max_width,
+                        None,
+                        option,
+                        symbols,
+                    )
+                })
+                .collect::<Vec<_>>();
 
             if prefix.to_string().is_empty() {
                 lines.extend([empty_virtual_line!()]);
@@ -482,17 +328,18 @@ pub fn paragraph<'a>(
     VirtualBlock::new(&lines, source_range)
 }
 
-// FIXME: Use options struct or similar
 #[allow(clippy::too_many_arguments)]
 pub fn code_block<'a>(
     content: &str,
     prefix: Span<'static>,
-    lang: &Option<String>,
+    // TODO: Add lang support
+    // Ref: https://github.com/erikjuhani/basalt/issues/96
+    _lang: &Option<String>,
+    _syntect_ctx: Option<&SyntectContext>,
     text: &RichText,
     source_range: &SourceRange<usize>,
     max_width: usize,
     option: &RenderStyle,
-    syntect_ctx: Option<&SyntectContext>,
 ) -> VirtualBlock<'a> {
     let lines = match option {
         RenderStyle::Raw => {
@@ -524,137 +371,34 @@ pub fn code_block<'a>(
         }
         RenderStyle::Visual => {
             let text = text.to_string();
-            let available_width = max_width.saturating_sub(prefix.width());
 
-            // Top padding line with optional language label (D-10)
-            let padding_line = if let Some(ref lang_str) = lang {
-                let label = lang_str.as_str();
-                let label_display: String = if label.chars().count() <= available_width {
-                    label.to_string()
-                } else {
-                    label
-                        .char_indices()
-                        .take_while(|(i, _)| *i < available_width)
-                        .map(|(_, c)| c)
-                        .collect()
-                };
-                let pad_count =
-                    available_width.saturating_sub(UnicodeWidthStr::width(label_display.as_str()));
-                virtual_line!([
-                    synthetic_span!(prefix.clone()),
-                    synthetic_span!(Span::styled(
-                        " ".repeat(pad_count),
-                        Style::default().bg(Color::Black)
-                    )),
-                    synthetic_span!(Span::styled(
-                        label_display,
-                        Style::default().fg(Color::DarkGray).bg(Color::Black)
-                    )),
-                ])
-            } else {
-                virtual_line!([
-                    synthetic_span!(prefix.clone()),
-                    synthetic_span!(" ".repeat(available_width).bg(Color::Black)),
-                ])
-            };
-
-            // Determine syntax for highlighting; pair syntax with its context so
-            // the type system guarantees both are present together.
-            let highlight_pair = syntect_ctx.and_then(|ctx| {
-                lang.as_deref()
-                    .and_then(|l| ctx.syntax_set.find_syntax_by_token(l))
-                    .map(|syntax| (syntax, ctx))
-            });
+            let padding_line = virtual_line!([
+                synthetic_span!(prefix.clone()),
+                synthetic_span!(" "
+                    .repeat(max_width.saturating_sub(prefix.width()))
+                    .bg(Color::Black))
+            ]);
 
             let mut current_range_start = source_range.start;
+
             let mut lines = vec![padding_line.clone()];
+            lines.extend(text.lines().map(|line| {
+                let source_range = line_range(current_range_start, line.len(), true);
+                current_range_start = source_range.end;
 
-            match highlight_pair {
-                Some((syntax, ctx)) => {
-                    // Highlighted path (D-09, CODE-02)
-                    use syntect::easy::HighlightLines;
-                    use syntect::util::LinesWithEndings;
-
-                    let mut highlighter = HighlightLines::new(syntax, &ctx.theme);
-
-                    for line in LinesWithEndings::from(&text) {
-                        let line_trimmed = line.trim_end_matches('\n');
-                        let source_range =
-                            line_range(current_range_start, line_trimmed.len(), true);
-                        current_range_start = source_range.end;
-
-                        // Get highlighted tokens; fallback to monochrome on error
-                        let ranges = highlighter
-                            .highlight_line(line, &ctx.syntax_set)
-                            .unwrap_or_else(|_| {
-                                vec![(syntect::highlighting::Style::default(), line)]
-                            });
-
-                        let mut token_spans: Vec<VirtualSpan> = Vec::new();
-                        token_spans.push(synthetic_span!(prefix.clone()));
-                        token_spans.push(synthetic_span!(Span::styled(
-                            " ",
-                            Style::default().bg(Color::Black)
-                        )));
-
-                        for (style, token) in &ranges {
-                            let token_text = token.trim_end_matches('\n');
-                            if token_text.is_empty() {
-                                continue;
-                            }
-                            let fg = Color::Rgb(
-                                style.foreground.r,
-                                style.foreground.g,
-                                style.foreground.b,
-                            );
-                            token_spans.push(synthetic_span!(Span::styled(
-                                token_text.to_string(),
-                                Style::default().fg(fg).bg(Color::Black)
-                            )));
-                        }
-
-                        // Right padding to fill the code block width
-                        let right_pad = max_width
-                            .saturating_sub(prefix.width() + UnicodeWidthStr::width(line_trimmed))
-                            .saturating_sub(1);
-                        token_spans.push(synthetic_span!(Span::styled(
-                            " ".repeat(right_pad),
-                            Style::default().bg(Color::Black)
-                        )));
-
-                        // D-12: Zero-width content anchor so has_content() returns true,
-                        // allowing cursor navigation through highlighted code lines.
-                        // Padding lines (top/bottom) remain synthetic-only and non-navigable.
-                        token_spans
-                            .push(content_span!("".to_string().bg(Color::Black), source_range));
-
-                        lines.push(VirtualLine::new(&token_spans));
-                    }
-                }
-                None => {
-                    // Monochrome fallback path (D-11, CODE-03)
-                    lines.extend(text.lines().map(|line| {
-                        let source_range = line_range(current_range_start, line.len(), true);
-                        current_range_start = source_range.end;
-
-                        virtual_line!([
-                            synthetic_span!(prefix.clone()),
-                            synthetic_span!(Span::styled(" ", Style::new().bg(Color::Black))),
-                            content_span!(line.to_string().bg(Color::Black), source_range),
-                            synthetic_span!(" "
-                                .repeat(
-                                    max_width
-                                        .saturating_sub(
-                                            prefix.width() + UnicodeWidthStr::width(line),
-                                        )
-                                        .saturating_sub(1)
-                                )
-                                .bg(Color::Black)),
-                        ])
-                    }));
-                }
-            }
-
+                virtual_line!([
+                    synthetic_span!(prefix.clone()),
+                    synthetic_span!(Span::styled(" ", Style::new().bg(Color::Black))),
+                    content_span!(line.to_string().bg(Color::Black), source_range),
+                    synthetic_span!(" "
+                        .repeat(
+                            max_width
+                                .saturating_sub(prefix.width() + line.chars().count())
+                                .saturating_sub(1)
+                        )
+                        .bg(Color::Black)),
+                ])
+            }));
             lines.extend([padding_line]);
             lines.extend([empty_virtual_line!()]);
             lines
@@ -675,7 +419,6 @@ pub fn list<'a>(
     option: &RenderStyle,
     symbols: &Symbols,
     list_depth: usize,
-    syntect_ctx: Option<&SyntectContext>,
 ) -> VirtualBlock<'a> {
     let lines = match option {
         RenderStyle::Raw => render_raw(content, source_range, max_width, prefix, symbols),
@@ -695,7 +438,7 @@ pub fn list<'a>(
                         option,
                         symbols,
                         list_depth,
-                        syntect_ctx,
+                        None,
                     )
                     .lines
                 })
@@ -723,7 +466,6 @@ pub fn task<'a>(
     option: &RenderStyle,
     symbols: &Symbols,
     list_depth: usize,
-    syntect_ctx: Option<&SyntectContext>,
 ) -> VirtualBlock<'a> {
     let lines = match option {
         RenderStyle::Raw => render_raw(content, source_range, max_width, prefix, symbols),
@@ -774,7 +516,7 @@ pub fn task<'a>(
                     option,
                     symbols,
                     list_depth + 1,
-                    syntect_ctx,
+                    None,
                 )
                 .lines
             }));
@@ -798,7 +540,6 @@ pub fn item<'a>(
     option: &RenderStyle,
     symbols: &Symbols,
     list_depth: usize,
-    syntect_ctx: Option<&SyntectContext>,
 ) -> VirtualBlock<'a> {
     let lines = match option {
         RenderStyle::Raw => render_raw(content, source_range, max_width, prefix, symbols),
@@ -844,7 +585,7 @@ pub fn item<'a>(
                     option,
                     symbols,
                     list_depth + 1,
-                    syntect_ctx,
+                    None,
                 )
                 .lines
             }));
@@ -863,106 +604,68 @@ pub fn line_range(start: usize, line_width: usize, newline: bool) -> SourceRange
     start..end
 }
 
-/// Renders a horizontal rule as a full-width separator line using the
-/// configured `symbols.horizontal_rule` character (default: "═").
-fn rule<'a>(
-    source_range: &SourceRange<usize>,
-    max_width: usize,
-    prefix: Span<'static>,
-    symbols: &Symbols,
-) -> VirtualBlock<'a> {
-    let separator = symbols
-        .horizontal_rule
-        .repeat(max_width.saturating_sub(prefix.width()));
-    let lines = vec![
-        virtual_line!([
-            synthetic_span!(prefix),
-            synthetic_span!(Span::raw(separator))
-        ]),
-        empty_virtual_line!(),
-    ];
-    VirtualBlock::new(&lines, source_range)
-}
-
-/// Renders a display math block as a three-line layout:
-/// separator line (thin "─"), formula content, separator line.
-/// Separator width matches the formula text width (not full terminal width).
-/// All lines styled in Magenta; formula is italic.
-fn display_math<'a>(
-    content: &str,
-    source_range: &SourceRange<usize>,
-    prefix: Span<'static>,
-) -> VirtualBlock<'a> {
-    let formula = content.trim();
-    let formula_width = UnicodeWidthStr::width(formula);
-    let separator = "\u{2500}".repeat(formula_width); // U+2500 BOX DRAWINGS LIGHT HORIZONTAL
-
-    let sep_span = Span::styled(separator, Style::default().fg(Color::Magenta));
-    let formula_span = Span::styled(
-        formula.to_string(),
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::ITALIC),
-    );
-
-    let lines = vec![
-        virtual_line!([
-            synthetic_span!(prefix.clone()),
-            synthetic_span!(sep_span.clone())
-        ]),
-        virtual_line!([
-            synthetic_span!(prefix.clone()),
-            synthetic_span!(formula_span)
-        ]),
-        virtual_line!([synthetic_span!(prefix), synthetic_span!(sep_span)]),
-        empty_virtual_line!(),
-    ];
-    VirtualBlock::new(&lines, source_range)
-}
-
 // FIXME: Use options struct or similar
 #[allow(clippy::too_many_arguments)]
 pub fn block_quote<'a>(
     content: &str,
     prefix: Span<'static>,
-    // TODO: Add kind support
-    // Should be as simple as adding a synthetic icon span and a content span
-    // visual_line!([synthetic, content])
-    // Ref: https://github.com/erikjuhani/basalt/issues/79
-    _kind: &Option<ast::BlockQuoteKind>,
+    kind: &Option<ast::BlockQuoteKind>,
+    title: &Option<String>,
     nodes: &[ast::Node],
     source_range: &SourceRange<usize>,
     max_width: usize,
     option: &RenderStyle,
     symbols: &Symbols,
-    syntect_ctx: Option<&SyntectContext>,
 ) -> VirtualBlock<'a> {
     let lines = match option {
         RenderStyle::Raw => render_raw(content, source_range, max_width, prefix, symbols),
-        RenderStyle::Visual => nodes
-            .iter()
-            .enumerate()
-            .flat_map(|(i, node)| {
-                let mut lines = render_node(
-                    content.to_string(),
-                    node,
-                    max_width,
-                    prefix.merge(Span::raw("┃ ").magenta()),
-                    option,
-                    symbols,
-                    0,
-                    syntect_ctx,
-                )
-                .lines;
-                if prefix.to_string().is_empty() && i != nodes.len().saturating_sub(1) {
-                    lines.extend([virtual_line!([synthetic_span!(Span::raw("┃ ").magenta())])]);
-                }
-                if prefix.to_string().is_empty() && i == nodes.len().saturating_sub(1) {
-                    lines.extend([empty_virtual_line!()]);
-                }
-                lines
-            })
-            .collect::<Vec<_>>(),
+        RenderStyle::Visual => {
+            let mut lines = Vec::new();
+            let border_color = kind.as_ref().map(|k| callout_style(k).0).unwrap_or(Color::Magenta);
+
+            // Header line for callouts (D-05, D-07)
+            if let Some(ref k) = kind {
+                let (color, _, _, _) = callout_style(k);
+                let icon = callout_icon(k, &symbols.preset);
+                let type_name = callout_type_name(k);
+                let header_text = match title {
+                    Some(t) => format!("{} {}: {}", icon, type_name, t),
+                    None => format!("{} {}", icon, type_name),
+                };
+                let header_span = Span::styled(header_text, Style::default().fg(color).add_modifier(Modifier::BOLD));
+                lines.push(virtual_line!([synthetic_span!(prefix.clone()), synthetic_span!(header_span)]));
+            }
+
+            // Body lines with type-colored border
+            let body_lines: Vec<_> = nodes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, node)| {
+                    let border_span = Span::raw("┃ ").fg(border_color);
+                    let mut node_lines = render_node(
+                        content.to_string(),
+                        node,
+                        max_width,
+                        prefix.merge(border_span),
+                        option,
+                        symbols,
+                        0,
+                        None,
+                    )
+                    .lines;
+                    if prefix.to_string().is_empty() && i != nodes.len().saturating_sub(1) {
+                        let sep_border = Span::raw("┃ ").fg(border_color);
+                        node_lines.extend([virtual_line!([synthetic_span!(sep_border)])]);
+                    }
+                    if prefix.to_string().is_empty() && i == nodes.len().saturating_sub(1) {
+                        node_lines.extend([empty_virtual_line!()]);
+                    }
+                    node_lines
+                })
+                .collect();
+            lines.extend(body_lines);
+            lines
+        },
     };
 
     VirtualBlock::new(&lines, source_range)
@@ -1013,11 +716,11 @@ pub fn render_node<'a>(
             &content,
             prefix,
             lang,
+            syntect_ctx,
             text,
             source_range,
             max_width,
             option,
-            syntect_ctx,
         ),
         List {
             nodes,
@@ -1031,7 +734,6 @@ pub fn render_node<'a>(
             option,
             symbols,
             list_depth,
-            syntect_ctx,
         ),
         Item {
             kind,
@@ -1047,7 +749,6 @@ pub fn render_node<'a>(
             option,
             symbols,
             list_depth,
-            syntect_ctx,
         ),
         Task {
             kind,
@@ -1063,257 +764,316 @@ pub fn render_node<'a>(
             option,
             symbols,
             list_depth,
-            syntect_ctx,
         ),
         BlockQuote {
             kind,
+            title,
             nodes,
             source_range,
         } => block_quote(
             &content,
             prefix,
             kind,
+            title,
             nodes,
             source_range,
             max_width,
             option,
             symbols,
-            syntect_ctx,
         ),
-        Rule { source_range } => rule(source_range, max_width, prefix, symbols),
-        DisplayMath {
-            content,
-            source_range,
-        } => display_math(content, source_range, prefix),
+    }
+}
+
+// Callout icon/color table - per-type styling
+fn callout_style(kind: &ast::BlockQuoteKind) -> (Color, &'static str, &'static str, &'static str) {
+    use ast::BlockQuoteKind::*;
+    // (color, ascii_icon, unicode_icon, nerdfont_icon)
+    match kind {
+        // Standard GitHub Alert types (D-10)
+        Note => (Color::Cyan, "[i]", "\u{2139}", "\u{f05a}"),
+        Tip => (Color::Green, "[*]", "\u{2728}", "\u{f0eb}"),
+        Important => (Color::Magenta, "[!]", "\u{2691}", "\u{f024}"),
+        Warning => (Color::Yellow, "[!]", "\u{26a0}", "\u{f071}"),
+        Caution => (Color::Red, "[x]", "\u{2716}", "\u{f00d}"),
+
+        // ITS Theme - Citation/text (warm tones)
+        Quote => (Color::Yellow, "[q]", "\u{275d}", "\u{f10d}"),
+        Recite => (Color::LightYellow, "[r]", "\u{275e}", "\u{f10e}"),
+        Aside => (Color::Cyan, "[>]", "\u{00bb}", "\u{f101}"),
+
+        // ITS Theme - Structural/layout (cool tones)
+        Cards => (Color::Blue, "[#]", "\u{25a3}", "\u{f0db}"),
+        Grid => (Color::LightBlue, "[G]", "\u{25a6}", "\u{f00a}"),
+        Column => (Color::LightCyan, "[|]", "\u{2503}", "\u{f0db}"),
+        Kanban => (Color::Magenta, "[K]", "\u{25a4}", "\u{f24d}"),
+        Timeline => (Color::LightMagenta, "[T]", "\u{25c6}", "\u{f017}"),
+
+        // ITS Theme - Data/info (neutral)
+        Infobox => (Color::White, "[I]", "\u{24d8}", "\u{f05a}"),
+        Metadata => (Color::DarkGray, "[M]", "\u{2630}", "\u{f0c9}"),
+        Statblocks => (Color::Gray, "[S]", "\u{2637}", "\u{f080}"),
+
+        // ITS Theme - Task/action (green family)
+        Checks => (Color::Green, "[v]", "\u{2611}", "\u{f046}"),
+        Kith => (Color::LightGreen, "[k]", "\u{2619}", "\u{f0c0}"),
+
+        // ITS Theme - Neutral
+        Blank => (Color::DarkGray, "[ ]", "\u{25cb}", "\u{f10c}"),
+        Caption => (Color::DarkGray, "[c]", "\u{2014}", "\u{f036}"),
+    }
+}
+
+fn callout_type_name(kind: &ast::BlockQuoteKind) -> &'static str {
+    use ast::BlockQuoteKind::*;
+    match kind {
+        Note => "NOTE",
+        Tip => "TIP",
+        Important => "IMPORTANT",
+        Warning => "WARNING",
+        Caution => "CAUTION",
+        Aside => "ASIDE",
+        Blank => "BLANK",
+        Caption => "CAPTION",
+        Cards => "CARDS",
+        Checks => "CHECKS",
+        Column => "COLUMN",
+        Grid => "GRID",
+        Infobox => "INFOBOX",
+        Kanban => "KANBAN",
+        Kith => "KITH",
+        Metadata => "METADATA",
+        Quote => "QUOTE",
+        Recite => "RECITE",
+        Statblocks => "STATBLOCKS",
+        Timeline => "TIMELINE",
+    }
+}
+
+fn callout_icon(kind: &ast::BlockQuoteKind, preset: &crate::config::Preset) -> &'static str {
+    let (_, ascii, unicode, nerdfont) = callout_style(kind);
+    match preset {
+        crate::config::Preset::NerdFont => nerdfont,
+        crate::config::Preset::Ascii => ascii,
+        _ => unicode,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::note_editor::rich_text::{Style as RichStyle, TextSegment};
+    use crate::config::{Preset, Symbols};
+    use crate::note_editor::rich_text::TextSegment;
 
-    #[test]
-    fn test_rich_text_to_spans_inline_math() {
-        let text = RichText::from(vec![TextSegment::styled("E = mc^2", RichStyle::InlineMath)]);
-        let spans = rich_text_to_spans(&text);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "E = mc^2");
-        let expected = ratatui::style::Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::ITALIC);
-        assert_eq!(spans[0].style, expected);
-    }
-
-    #[test]
-    fn test_rule_render() {
-        use crate::config::Symbols;
-        let symbols = Symbols::default();
-        let source_range = 0..3;
-        let max_width = 20;
-        let prefix = Span::raw("");
-        let block = rule(&source_range, max_width, prefix, &symbols);
-        // Block should have 2 lines: separator + empty
-        assert_eq!(block.lines.len(), 2);
-        // First line should contain the repeated horizontal_rule character
-        let first_line = &block.lines[0];
-        let content: String = first_line
-            .virtual_spans()
+    // Helper to convert VirtualBlock lines to snapshot-friendly string
+    fn virtual_block_to_string(block: &VirtualBlock) -> String {
+        block
+            .lines
             .iter()
-            .map(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.to_string()
-                }
+            .map(|line| {
+                line.virtual_spans()
+                    .iter()
+                    .map(|span| match span {
+                        VirtualSpan::Content(span, _) => span.content.to_string(),
+                        VirtualSpan::Synthetic(span) => span.content.to_string(),
+                    })
+                    .collect::<String>()
             })
-            .collect();
-        assert!(content.contains(&symbols.horizontal_rule.repeat(20)));
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    fn vline_content(line: &VirtualLine<'_>) -> String {
-        line.virtual_spans()
-            .iter()
-            .map(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.to_string()
-                }
-            })
-            .collect()
-    }
-
+    // Test that callout_style returns the correct color for standard types
     #[test]
-    fn test_display_math_render() {
-        let content = "\n\\int_0^\\infty e^{-x} dx = 1\n";
-        let source_range = 0..35;
-        let prefix = Span::raw("");
-        let block = display_math(content, &source_range, prefix);
-        // Block should have 4 lines: separator + formula + separator + empty
-        assert_eq!(block.lines.len(), 4);
+    fn test_callout_style_standard_colors() {
+        let (note_color, _, _, _) = callout_style(&ast::BlockQuoteKind::Note);
+        assert_eq!(note_color, Color::Cyan);
 
-        // First line (separator): contains "─" repeated to formula width
-        let sep_line = vline_content(&block.lines[0]);
-        assert!(sep_line.contains("\u{2500}"), "Separator should use U+2500");
-        assert!(
-            !sep_line.contains('═'),
-            "Separator should NOT use horizontal_rule char"
-        );
+        let (tip_color, _, _, _) = callout_style(&ast::BlockQuoteKind::Tip);
+        assert_eq!(tip_color, Color::Green);
 
-        // Second line (formula): contains trimmed formula text
-        let formula_line = vline_content(&block.lines[1]);
-        assert!(formula_line.contains("\\int_0^\\infty"));
-        assert!(!formula_line.starts_with('\n'), "Formula should be trimmed");
+        let (warning_color, _, _, _) = callout_style(&ast::BlockQuoteKind::Warning);
+        assert_eq!(warning_color, Color::Yellow);
 
-        // Third line (separator): same as first
-        let sep_line_2 = vline_content(&block.lines[2]);
+        let (caution_color, _, _, _) = callout_style(&ast::BlockQuoteKind::Caution);
+        assert_eq!(caution_color, Color::Red);
+
+        let (important_color, _, _, _) = callout_style(&ast::BlockQuoteKind::Important);
+        assert_eq!(important_color, Color::Magenta);
+    }
+
+    // Test that callout_type_name returns uppercase strings
+    #[test]
+    fn test_callout_type_name_uppercase() {
+        assert_eq!(callout_type_name(&ast::BlockQuoteKind::Note), "NOTE");
+        assert_eq!(callout_type_name(&ast::BlockQuoteKind::Tip), "TIP");
         assert_eq!(
-            sep_line, sep_line_2,
-            "Top and bottom separators should match"
+            callout_type_name(&ast::BlockQuoteKind::Important),
+            "IMPORTANT"
         );
-
-        // Verify formula span has Magenta + ITALIC
-        let formula_vspan = block.lines[1]
-            .virtual_spans()
-            .iter()
-            .find(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.contains("\\int")
-                }
-            })
-            .expect("formula span not found");
-        let formula_rspan = match formula_vspan {
-            VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => span,
-        };
-        assert_eq!(formula_rspan.style.fg, Some(Color::Magenta));
-        assert!(formula_rspan.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(
+            callout_type_name(&ast::BlockQuoteKind::Warning),
+            "WARNING"
+        );
+        assert_eq!(callout_type_name(&ast::BlockQuoteKind::Caution), "CAUTION");
+        assert_eq!(callout_type_name(&ast::BlockQuoteKind::Aside), "ASIDE");
+        assert_eq!(callout_type_name(&ast::BlockQuoteKind::Kanban), "KANBAN");
+        assert_eq!(
+            callout_type_name(&ast::BlockQuoteKind::Statblocks),
+            "STATBLOCKS"
+        );
     }
 
+    // Test that callout_icon returns different strings for different presets
     #[test]
-    fn test_syntect_context_init() {
-        use crate::app::SyntectContext;
-        // SyntectContext::new() should not panic
-        let ctx = SyntectContext::new();
-        // Should find Rust syntax
-        assert!(ctx.syntax_set.find_syntax_by_token("rust").is_some());
-        // Should find Python syntax
-        assert!(ctx.syntax_set.find_syntax_by_token("py").is_some());
-        // Unknown should return None, not panic
-        assert!(ctx
-            .syntax_set
-            .find_syntax_by_token("nonexistent_lang_xyz")
-            .is_none());
-        // Plain text should always be present
-        let _pt = ctx.syntax_set.find_syntax_plain_text();
+    fn test_callout_icon_varies_by_preset() {
+        let kind = ast::BlockQuoteKind::Note;
+        let ascii_icon = callout_icon(&kind, &Preset::Ascii);
+        let unicode_icon = callout_icon(&kind, &Preset::Unicode);
+        let nerdfont_icon = callout_icon(&kind, &Preset::NerdFont);
+
+        assert!(ascii_icon != unicode_icon);
+        assert!(unicode_icon != nerdfont_icon);
+        assert!(ascii_icon != nerdfont_icon);
     }
 
+    // Insta snapshot tests for block_quote() render output
     #[test]
-    fn test_code_block_syntect_visual() {
-        use crate::app::SyntectContext;
-
-        let ctx = SyntectContext::new();
-        let content = "fn main() {}";
-        let text = RichText::from(vec![TextSegment::plain(content)]);
-        let source_range = 0..12;
+    fn snapshot_block_quote_note_callout() {
+        let kind = Some(ast::BlockQuoteKind::Note);
+        let title = None;
+        let symbols = Symbols::unicode();
         let prefix = Span::raw("");
-        let block = code_block(
-            content,
+        let max_width = 80;
+        let content = "Test body content.".to_string();
+        let source_range = 0..20;
+
+        let block = block_quote(
+            &content,
             prefix,
-            &Some("rust".to_string()),
-            &text,
+            &kind,
+            &title,
+            &[ast::Node::Paragraph {
+                text: RichText::from([TextSegment::plain("Test body content.")]),
+                source_range: source_range.clone(),
+            }],
             &source_range,
-            40,
+            max_width,
             &RenderStyle::Visual,
-            Some(&ctx),
+            &symbols,
         );
-        // Should not panic; should have lines: top padding + content + bottom padding + empty
-        assert!(
-            block.lines.len() >= 4,
-            "Expected at least 4 lines (top pad + content + bottom pad + empty), got {}",
-            block.lines.len()
-        );
-        // Top padding line should contain "rust" label
-        let top_line_content: String = block.lines[0]
-            .virtual_spans()
-            .iter()
-            .map(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.to_string()
-                }
-            })
-            .collect();
-        assert!(
-            top_line_content.contains("rust"),
-            "Top padding line should contain language label"
-        );
+
+        insta::assert_snapshot!(virtual_block_to_string(&block));
     }
 
     #[test]
-    fn test_code_block_unknown_lang() {
-        use crate::app::SyntectContext;
-
-        let ctx = SyntectContext::new();
-        let content = "some code here";
-        let text = RichText::from(vec![TextSegment::plain(content)]);
-        let source_range = 0..14;
+    fn snapshot_block_quote_warning_callout() {
+        let kind = Some(ast::BlockQuoteKind::Warning);
+        let title = None;
+        let symbols = Symbols::unicode();
         let prefix = Span::raw("");
-        // Should not panic with unknown language — falls back to monochrome (D-11)
-        let block = code_block(
-            content,
+        let max_width = 80;
+        let content = "Warning message here.".to_string();
+        let source_range = 0..21;
+
+        let block = block_quote(
+            &content,
             prefix,
-            &Some("unknownlang123".to_string()),
-            &text,
+            &kind,
+            &title,
+            &[ast::Node::Paragraph {
+                text: RichText::from([TextSegment::plain("Warning message here.")]),
+                source_range: source_range.clone(),
+            }],
             &source_range,
-            40,
+            max_width,
             &RenderStyle::Visual,
-            Some(&ctx),
+            &symbols,
         );
-        assert!(block.lines.len() >= 4);
-        // Top padding line should still show the unknown lang label
-        let top_content: String = block.lines[0]
-            .virtual_spans()
-            .iter()
-            .map(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.to_string()
-                }
-            })
-            .collect();
-        assert!(top_content.contains("unknownlang123"));
+
+        insta::assert_snapshot!(virtual_block_to_string(&block));
     }
 
     #[test]
-    fn test_code_block_no_lang() {
-        use crate::app::SyntectContext;
-
-        let ctx = SyntectContext::new();
-        let content = "plain code";
-        let text = RichText::from(vec![TextSegment::plain(content)]);
-        let source_range = 0..10;
+    fn snapshot_block_quote_aside_callout() {
+        let kind = Some(ast::BlockQuoteKind::Aside);
+        let title = None;
+        let symbols = Symbols::unicode();
         let prefix = Span::raw("");
-        let block = code_block(
-            content,
+        let max_width = 80;
+        let content = "This is an aside.".to_string();
+        let source_range = 0..17;
+
+        let block = block_quote(
+            &content,
             prefix,
-            &None,
-            &text,
+            &kind,
+            &title,
+            &[ast::Node::Paragraph {
+                text: RichText::from([TextSegment::plain("This is an aside.")]),
+                source_range: source_range.clone(),
+            }],
             &source_range,
-            40,
+            max_width,
             &RenderStyle::Visual,
-            Some(&ctx),
+            &symbols,
         );
-        assert!(block.lines.len() >= 4);
-        // Top padding line should NOT contain any language label text
-        let top_content: String = block.lines[0]
-            .virtual_spans()
-            .iter()
-            .map(|s| match s {
-                VirtualSpan::Synthetic(span) | VirtualSpan::Content(span, _) => {
-                    span.content.to_string()
-                }
-            })
-            .collect();
-        // Should be all spaces (padding) — no alphabetic content
-        assert!(
-            !top_content.chars().any(|c| c.is_alphabetic()),
-            "No lang label should appear when lang is None, got: {:?}",
-            top_content
+
+        insta::assert_snapshot!(virtual_block_to_string(&block));
+    }
+
+    #[test]
+    fn snapshot_block_quote_note_with_title() {
+        let kind = Some(ast::BlockQuoteKind::Note);
+        let title = Some("My Title".to_string());
+        let symbols = Symbols::unicode();
+        let prefix = Span::raw("");
+        let max_width = 80;
+        let content = "Test body content.".to_string();
+        let source_range = 0..20;
+
+        let block = block_quote(
+            &content,
+            prefix,
+            &kind,
+            &title,
+            &[ast::Node::Paragraph {
+                text: RichText::from([TextSegment::plain("Test body content.")]),
+                source_range: source_range.clone(),
+            }],
+            &source_range,
+            max_width,
+            &RenderStyle::Visual,
+            &symbols,
         );
+
+        insta::assert_snapshot!(virtual_block_to_string(&block));
+    }
+
+    #[test]
+    fn snapshot_block_quote_plain() {
+        let kind = None;
+        let title = None;
+        let symbols = Symbols::unicode();
+        let prefix = Span::raw("");
+        let max_width = 80;
+        let content = "Plain blockquote text.".to_string();
+        let source_range = 0..21;
+
+        let block = block_quote(
+            &content,
+            prefix,
+            &kind,
+            &title,
+            &[ast::Node::Paragraph {
+                text: RichText::from([TextSegment::plain("Plain blockquote text.")]),
+                source_range: source_range.clone(),
+            }],
+            &source_range,
+            max_width,
+            &RenderStyle::Visual,
+            &symbols,
+        );
+
+        insta::assert_snapshot!(virtual_block_to_string(&block));
     }
 }

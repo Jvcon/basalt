@@ -65,21 +65,12 @@ impl<'a> Parser<'a> {
         let mut result = Vec::new();
         let mut state = ParserState::default();
 
-        while let Some((event, source_range)) = self.next() {
+        while let Some((event, _)) = self.next() {
             match event {
                 Event::Start(tag) if Self::is_container_tag(&tag) => {
                     if let Some(node) = self.parse_container(tag, &mut state) {
                         result.push(node);
                     }
-                }
-                Event::Rule => {
-                    result.push(Node::Rule { source_range });
-                }
-                Event::DisplayMath(content) => {
-                    result.push(Node::DisplayMath {
-                        content: content.to_string(),
-                        source_range,
-                    });
                 }
                 _ => {}
             }
@@ -92,9 +83,6 @@ impl<'a> Parser<'a> {
         let mut nodes = Vec::new();
         let mut text_segments = Vec::new();
         let mut inline_styles = Vec::new();
-        // Stores display math content when DisplayMath fires inside a Paragraph container.
-        // pulldown-cmark wraps $$...$$ blocks in Start(Paragraph)/End(Paragraph).
-        let mut paragraph_display_math: Option<(String, SourceRange<usize>)> = None;
 
         match tag {
             Tag::List(Some(start)) => {
@@ -131,17 +119,6 @@ impl<'a> Parser<'a> {
                 Event::Code(text) => {
                     let text_segment = TextSegment::styled(&text, Style::Code);
                     text_segments.push(text_segment);
-                }
-
-                Event::InlineMath(text) => {
-                    let text_segment = TextSegment::styled(&text, Style::InlineMath);
-                    text_segments.push(text_segment);
-                }
-
-                // DisplayMath fires inside a Paragraph container in pulldown-cmark.
-                // Capture it so we can return Node::DisplayMath instead of Node::Paragraph.
-                Event::DisplayMath(content) => {
-                    paragraph_display_math = Some((content.to_string(), source_range));
                 }
 
                 Event::Text(text) => {
@@ -226,23 +203,71 @@ impl<'a> Parser<'a> {
                             text,
                             source_range,
                         }),
-                        Tag::BlockQuote(kind) => Some(Node::BlockQuote {
-                            kind: kind.map(|kind| kind.into()),
-                            nodes,
-                            source_range,
-                        }),
-                        Tag::Paragraph => {
-                            // If this paragraph contained a display math block, return that
-                            // instead. pulldown-cmark wraps $$...$$ in a Paragraph container.
-                            if let Some((content, math_range)) = paragraph_display_math {
-                                Some(Node::DisplayMath {
-                                    content,
-                                    source_range: math_range,
-                                })
-                            } else {
-                                Some(Node::Paragraph { text, source_range })
+                        Tag::BlockQuote(kind) => {
+                            let mut resolved_kind = kind.map(ast::BlockQuoteKind::from);
+                            let mut title: Option<String> = None;
+
+                            // ITS Theme detection: only when pulldown-cmark did not recognize the
+                            // type (kind == None). Standard types (Note/Tip/etc.) are already
+                            // consumed by pulldown-cmark and their [!TYPE] line is removed.
+                            //
+                            // When `> [!aside]\n> body text` is parsed, pulldown-cmark merges
+                            // both lines into a single tight Paragraph with a SoftBreak event
+                            // (which becomes '\n' in the RichText). We detect the [!type] pattern
+                            // only on the first line, and if body content follows after '\n',
+                            // we re-insert it as a new Paragraph node in the nodes list.
+                            if resolved_kind.is_none() {
+                                if let Some(first_text) =
+                                    nodes.first().and_then(extract_paragraph_text)
+                                {
+                                    // Only examine the first line (before any SoftBreak newline).
+                                    let (first_line, remainder) =
+                                        match first_text.split_once('\n') {
+                                            Some((first, rest)) => (first.trim(), rest.trim()),
+                                            None => (first_text.trim(), ""),
+                                        };
+                                    if let Some(rest) = first_line.strip_prefix("[!") {
+                                        if let Some(bracket_end) = rest.find(']') {
+                                            let type_str = &rest[..bracket_end];
+                                            let after_bracket =
+                                                rest[bracket_end + 1..].trim().to_string();
+                                            if let Some(detected_kind) = its_theme_kind(type_str) {
+                                                resolved_kind = Some(detected_kind);
+                                                title = if after_bracket.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(after_bracket)
+                                                };
+                                                let first_range =
+                                                    nodes[0].source_range().clone();
+                                                nodes.remove(0);
+                                                // Re-insert body content after the [!type] line
+                                                // (merged by SoftBreak) as a new Paragraph node.
+                                                if !remainder.is_empty() {
+                                                    nodes.insert(
+                                                        0,
+                                                        Node::Paragraph {
+                                                            text: RichText::from(
+                                                                [TextSegment::plain(remainder)],
+                                                            ),
+                                                            source_range: first_range,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
+
+                            Some(Node::BlockQuote {
+                                kind: resolved_kind,
+                                title,
+                                nodes,
+                                source_range,
+                            })
                         }
+                        Tag::Paragraph => Some(Node::Paragraph { text, source_range }),
                         _ => None,
                     };
                 }
@@ -296,6 +321,47 @@ impl<'a> Parser<'a> {
             Tag::Strikethrough => Some(Style::Strikethrough),
             _ => None,
         }
+    }
+}
+
+/// Maps an ITS Theme callout type string (case-insensitive) to a [`ast::BlockQuoteKind`] variant.
+/// Returns [`None`] for unrecognized type strings (treated as plain blockquotes).
+/// Handles aliases: caption/captions, column/columns, quote/quotes.
+fn its_theme_kind(type_str: &str) -> Option<ast::BlockQuoteKind> {
+    match type_str.to_ascii_lowercase().as_str() {
+        // Standard GitHub Alert types (for case-insensitive support)
+        "note" => Some(ast::BlockQuoteKind::Note),
+        "tip" => Some(ast::BlockQuoteKind::Tip),
+        "important" => Some(ast::BlockQuoteKind::Important),
+        "warning" => Some(ast::BlockQuoteKind::Warning),
+        "caution" => Some(ast::BlockQuoteKind::Caution),
+        // ITS Theme Extended (post-processing detection)
+        "aside" => Some(ast::BlockQuoteKind::Aside),
+        "blank" => Some(ast::BlockQuoteKind::Blank),
+        "caption" | "captions" => Some(ast::BlockQuoteKind::Caption),
+        "cards" => Some(ast::BlockQuoteKind::Cards),
+        "checks" => Some(ast::BlockQuoteKind::Checks),
+        "column" | "columns" => Some(ast::BlockQuoteKind::Column),
+        "grid" => Some(ast::BlockQuoteKind::Grid),
+        "infobox" => Some(ast::BlockQuoteKind::Infobox),
+        "kanban" => Some(ast::BlockQuoteKind::Kanban),
+        "kith" => Some(ast::BlockQuoteKind::Kith),
+        "metadata" => Some(ast::BlockQuoteKind::Metadata),
+        "quote" | "quotes" => Some(ast::BlockQuoteKind::Quote),
+        "recite" => Some(ast::BlockQuoteKind::Recite),
+        "statblocks" => Some(ast::BlockQuoteKind::Statblocks),
+        "timeline" => Some(ast::BlockQuoteKind::Timeline),
+        _ => None,
+    }
+}
+
+/// Extracts the text content of a [`Node::Paragraph`] as a [`String`].
+/// Returns [`None`] if the node is not a paragraph.
+fn extract_paragraph_text(node: &ast::Node) -> Option<String> {
+    if let ast::Node::Paragraph { text, .. } = node {
+        Some(text.to_string())
+    } else {
+        None
     }
 }
 
@@ -415,37 +481,23 @@ mod tests {
                   - [ ] Subtask 2
                 "#},
             ),
-            (
-                "horizontal_rule",
-                indoc! { r#"## Horizontal rule
-                You can use three or more stars `***`, hyphens `---`, or underscore `___` on its own line to add a horizontal bar. You can also separate symbols using spaces.
-
-                ***
-                ****
-                * * *
-                ---
-                ----
-                - - -
-                ___
-                ____
-                _ _ _
-                "#},
-            ),
-            (
-                "inline_math",
-                indoc! { r#"## Math
-                Euler's identity: $e^{i\pi} + 1 = 0$ is beautiful.
-                "#},
-            ),
-            (
-                "display_math",
-                indoc! { r#"## Display Math
-
-                $$
-                \int_0^\infty e^{-x} dx = 1
-                $$
-                "#},
-            ),
+            // TODO: Implement horizontal rule
+            // (
+            //     "horizontal_rule",
+            //     indoc! { r#"## Horizontal rule
+            //     You can use three or more stars `***`, hyphens `---`, or underscore `___` on its own line to add a horizontal bar. You can also separate symbols using spaces.
+            //
+            //     ***
+            //     ****
+            //     * * *
+            //     ---
+            //     ----
+            //     - - -
+            //     ___
+            //     ____
+            //     _ _ _
+            //     "#},
+            // ),
             (
                 "code_blocks",
                 indoc! { r#"## Code blocks
@@ -487,5 +539,111 @@ mod tests {
                 )
             );
         });
+    }
+
+    /// Parse a blockquote input and return (kind, title, body_texts).
+    fn parse_bq(input: &str) -> (Option<ast::BlockQuoteKind>, Option<String>, Vec<String>) {
+        let nodes = from_str(input);
+        assert_eq!(nodes.len(), 1, "expected one top-level node");
+        match nodes.into_iter().next().unwrap() {
+            Node::BlockQuote { kind, title, nodes, .. } => {
+                let texts = nodes
+                    .into_iter()
+                    .filter_map(|n| match n {
+                        Node::Paragraph { text, .. } => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                (kind, title, texts)
+            }
+            _ => panic!("expected BlockQuote"),
+        }
+    }
+
+    #[test]
+    fn its_theme_aside_callout() {
+        let (kind, title, body) = parse_bq("> [!aside]\n> body text");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Aside));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text"]);
+    }
+
+    #[test]
+    fn its_theme_kanban_with_title() {
+        let (kind, title, body) = parse_bq("> [!kanban] My Board\n> body text");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Kanban));
+        assert_eq!(title, Some("My Board".to_string()));
+        assert_eq!(body, vec!["body text"]);
+    }
+
+    #[test]
+    fn its_theme_case_insensitive() {
+        let (kind, title, body) = parse_bq("> [!ASIDE]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Aside));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body"]);
+    }
+
+    #[test]
+    fn its_theme_aliases() {
+        let (kind, _, _) = parse_bq("> [!captions]\n> text");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Caption));
+
+        let (kind2, _, _) = parse_bq("> [!columns]\n> text");
+        assert_eq!(kind2, Some(ast::BlockQuoteKind::Column));
+
+        let (kind3, _, _) = parse_bq("> [!quotes]\n> text");
+        assert_eq!(kind3, Some(ast::BlockQuoteKind::Quote));
+    }
+
+    #[test]
+    fn plain_blockquote_unchanged() {
+        let (kind, title, _) = parse_bq("> plain text");
+        assert_eq!(kind, None);
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn unknown_type_stays_plain() {
+        let (kind, title, _) = parse_bq("> [!unknowntype]\n> body");
+        assert_eq!(kind, None);
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn standard_callout_kind_unchanged() {
+        // pulldown-cmark natively recognizes [!tip], kind is Some(Tip)
+        let (kind, title, body) = parse_bq("> [!tip]\n> body text");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Tip));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text"]);
+    }
+
+    #[test]
+    fn standard_callout_case_insensitive() {
+        // Verify ITS Theme detection handles lowercase standard types.
+        let (kind, title, body) = parse_bq("> [!note]\n> body text");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Note));
+        assert_eq!(title, None);
+        assert_eq!(body, vec!["body text"]);
+    }
+
+    #[test]
+    fn standard_callout_all_types_support() {
+        // Test all 5 standard types with lowercase.
+        let (kind, _, _) = parse_bq("> [!note]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Note));
+
+        let (kind, _, _) = parse_bq("> [!tip]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Tip));
+
+        let (kind, _, _) = parse_bq("> [!important]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Important));
+
+        let (kind, _, _) = parse_bq("> [!warning]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Warning));
+
+        let (kind, _, _) = parse_bq("> [!caution]\n> body");
+        assert_eq!(kind, Some(ast::BlockQuoteKind::Caution));
     }
 }
